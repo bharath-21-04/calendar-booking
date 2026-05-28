@@ -82,6 +82,21 @@ async def tools_node(state: AgentState, config: RunnableConfig) -> dict:
     log.info("── tools_node ── executing: %s", tool_names)
     result = await _raw_tools_node.ainvoke(state, config=config)
     log.info("── tools_node ── finished: %s", tool_names)
+
+    caller_name = state.get("caller_name") or ""
+    if not caller_name and hasattr(last_ai, "tool_calls"):
+        for tc in last_ai.tool_calls:
+            name = tc.get("args", {}).get("caller_name", "")
+            if name:
+                caller_name = name
+                log.info(
+                    "tools_node: captured caller_name=%r from tool %s", name, tc["name"]
+                )
+                break
+
+    if caller_name and caller_name != state.get("caller_name"):
+        result["caller_name"] = caller_name
+
     return result
 
 
