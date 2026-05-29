@@ -4,20 +4,21 @@ import json
 from datetime import date, datetime, timedelta
 
 from integrations.calendar import CalendarClient
+from integrations.db import BookingDB
 from config.settings import get_settings
 
 CLASS_TYPES = ["Reformer", "Mat", "Tower"]
 SEED_SCHEDULE = [
-    (6, 0, "Reformer", 10, 0),  # open
-    (9, 0, "Mat", 8, 8),  # FULL
-    (12, 0, "Tower", 10, 5),  # open (5 left)
-    (17, 0, "Reformer", 10, 10),  # FULL
-    (18, 0, "Mat", 8, 3),  # open (5 left)
-    (19, 0, "Tower", 10, 0),  # open
-    (6, 0, "Mat", 8, 0),  # open  (day + 2)
-    (9, 0, "Reformer", 10, 9),  # open (1 left — edge case)
-    (18, 0, "Reformer", 10, 0),  # open (day + 3)
-    (7, 0, "Tower", 10, 10),  # FULL (day + 4)
+    (6, 0, "Reformer", 10, 0),
+    (9, 0, "Mat", 8, 8),
+    (12, 0, "Tower", 10, 5),
+    (17, 0, "Reformer", 10, 10),
+    (18, 0, "Mat", 8, 3),
+    (19, 0, "Tower", 10, 0),
+    (6, 0, "Mat", 8, 0),
+    (9, 0, "Reformer", 10, 9),
+    (18, 0, "Reformer", 10, 0),
+    (7, 0, "Tower", 10, 10),
 ]
 
 DAY_OFFSETS = [1, 1, 1, 1, 1, 1, 2, 2, 3, 4]
@@ -30,13 +31,13 @@ def _make_fake_bookings(count: int) -> list[dict]:
 
 
 def seed() -> None:
-    """Insert test events into Google Calendar. Skips existing duplicates."""
     client = CalendarClient()
+    db = BookingDB()
     settings = get_settings()
     today = date.today()
 
-    for idx, ((hour, minute, cls_type, capacity, pre_booked), day_offset) in enumerate(
-        zip(SEED_SCHEDULE, DAY_OFFSETS)
+    for (hour, minute, cls_type, capacity, pre_booked), day_offset in zip(
+        SEED_SCHEDULE, DAY_OFFSETS
     ):
         event_date = today + timedelta(days=day_offset)
         start_dt = datetime(
@@ -51,16 +52,9 @@ def seed() -> None:
             print(f"[seed] Skipping (exists): {title} on {event_date}")
             continue
 
-        description = json.dumps(
-            {
-                "capacity": capacity,
-                "bookings": _make_fake_bookings(pre_booked),
-            }
-        )
-
         event_body = {
             "summary": title,
-            "description": description,
+            "description": json.dumps({"capacity": capacity}),
             "start": {
                 "dateTime": start_dt.isoformat(),
                 "timeZone": settings.studio_timezone,
@@ -71,13 +65,20 @@ def seed() -> None:
             },
         }
 
-        client._service.events().insert(
-            calendarId=settings.google_calendar_id, body=event_body
-        ).execute()
+        created = (
+            client._service.events()
+            .insert(calendarId=settings.google_calendar_id, body=event_body)
+            .execute()
+        )
+        class_id = created["id"]
+
+        for booking in _make_fake_bookings(pre_booked):
+            db.add(class_id, booking["name"], booking["phone"])
+
         status = "FULL" if pre_booked >= capacity else f"{capacity - pre_booked} spots"
         print(f"[seed] Created: {title} on {event_date} ({status})")
 
-    print("[seed] Calendar seeding done.")
+    print("[seed] Done.")
 
 
 if __name__ == "__main__":

@@ -2,14 +2,15 @@ from __future__ import annotations
 
 import json
 import logging
+import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 import google.oauth2.service_account
 import googleapiclient.discovery
-from googleapiclient.errors import HttpError
 
 from config.settings import get_settings
+from integrations.db import BookingDB
 
 log = logging.getLogger(__name__)
 
@@ -39,6 +40,7 @@ class CalendarClient:
         )
         self._calendar_id = settings.google_calendar_id
         self._default_capacity = settings.class_capacity_default
+        self._db = BookingDB()
 
     def list_classes(self, date: str) -> list[ClassSlot]:
         time_min = f"{date}T08:00:00Z"
@@ -60,9 +62,8 @@ class CalendarClient:
 
         slots = []
         for event in result.get("items", []):
-            data = self._parse_description(event.get("description"))
-            capacity = data.get("capacity", self._default_capacity)
-            bookings = data.get("bookings", [])
+            capacity = self._get_capacity(event.get("description"))
+            booked = self._db.count(event["id"])
             start = event.get("start", {}).get(
                 "dateTime", event.get("start", {}).get("date", "")
             )
@@ -71,7 +72,7 @@ class CalendarClient:
                     class_id=event["id"],
                     title=event.get("summary", "Class"),
                     time=start,
-                    spots_left=max(0, capacity - len(bookings)),
+                    spots_left=max(0, capacity - booked),
                     capacity=capacity,
                 )
             )
@@ -83,10 +84,8 @@ class CalendarClient:
             .get(calendarId=self._calendar_id, eventId=class_id)
             .execute()
         )
-        data = self._parse_description(event.get("description"))
-        capacity = data.get("capacity", self._default_capacity)
-        bookings = data.get("bookings", [])
-        return max(0, capacity - len(bookings))
+        capacity = self._get_capacity(event.get("description"))
+        return max(0, capacity - self._db.count(class_id))
 
     def book_class(self, class_id: str, name: str, phone: str) -> str:
         event = (
@@ -94,40 +93,23 @@ class CalendarClient:
             .get(calendarId=self._calendar_id, eventId=class_id)
             .execute()
         )
-        etag = event.get("etag", "")
-        data = self._parse_description(event.get("description"))
-        capacity = data.get("capacity", self._default_capacity)
-        bookings = data.get("bookings", [])
+        capacity = self._get_capacity(event.get("description"))
+        booked = self._db.count(class_id)
 
         log.info(
-            "book_class: event=%s capacity=%d existing_bookings=%d",
+            "book_class: event=%s capacity=%d booked=%d",
             class_id,
             capacity,
-            len(bookings),
+            booked,
         )
 
-        if len(bookings) >= capacity:
+        if booked >= capacity:
             raise ValueError("Class is fully booked.")
 
-        bookings.append({"name": name, "phone": phone})
-        data["bookings"] = bookings
-
-        self._patch_event(class_id, {"description": json.dumps(data)}, etag)
-
-        updated = (
-            self._service.events()
-            .get(calendarId=self._calendar_id, eventId=class_id)
-            .execute()
-        )
-        saved = self._parse_description(updated.get("description"))
-        saved_count = len(saved.get("bookings", []))
-        log.info(
-            "book_class: after patch bookings_count=%d (expected %d)",
-            saved_count,
-            len(bookings),
-        )
-        if saved_count != len(bookings):
-            log.error("book_class: patch did not persist! event=%s", class_id)
+        try:
+            self._db.add(class_id, name, phone)
+        except sqlite3.IntegrityError:
+            raise ValueError(f"{name} already has a booking for this class.")
 
         title = event.get("summary", "class")
         start = event.get("start", {}).get(
@@ -151,31 +133,10 @@ class CalendarClient:
             .get(calendarId=self._calendar_id, eventId=class_id)
             .execute()
         )
-        etag = event.get("etag", "")
-        data = self._parse_description(event.get("description"))
-        bookings = data.get("bookings", [])
 
-        log.info(
-            "cancel_booking: event=%s existing_bookings=%d name=%s phone=%s",
-            class_id,
-            len(bookings),
-            name,
-            phone,
-        )
-
-        updated = [
-            b for b in bookings if b.get("name") != name and b.get("phone") != phone
-        ]
-        if len(updated) == len(bookings):
+        removed = self._db.remove(class_id, name, phone)
+        if removed == 0:
             raise ValueError(f"No booking found for {name} / {phone}.")
-
-        data["bookings"] = updated
-        self._patch_event(class_id, {"description": json.dumps(data)}, etag)
-        log.info(
-            "cancel_booking: removed %d booking(s), now %d remain",
-            len(bookings) - len(updated),
-            len(updated),
-        )
 
         title = event.get("summary", "class")
         start = event.get("start", {}).get(
@@ -183,55 +144,13 @@ class CalendarClient:
         )
         return f"Cancelled: {title} at {self._format_time(start)}"
 
-    def _parse_description(self, description: str | None) -> dict:
-
+    def _get_capacity(self, description: str | None) -> int:
         if not description:
-            return {"capacity": self._default_capacity, "bookings": []}
+            return self._default_capacity
         try:
-            return json.loads(description)
+            return json.loads(description).get("capacity", self._default_capacity)
         except (json.JSONDecodeError, ValueError):
-            return {"capacity": self._default_capacity, "bookings": []}
-
-    def _patch_event(self, event_id: str, body: dict, etag: str) -> dict:
-        request = self._service.events().patch(
-            calendarId=self._calendar_id,
-            eventId=event_id,
-            body=body,
-        )
-        if etag:
-            request.headers["If-Match"] = etag
-        try:
-            result = request.execute()
-            log.debug(
-                "_patch_event: success event=%s new_etag=%s",
-                event_id,
-                result.get("etag", ""),
-            )
-            return result
-        except HttpError as exc:
-            if exc.resp.status == 412:
-                log.warning(
-                    "_patch_event: 412 ETag mismatch for %s, retrying", event_id
-                )
-                fresh = (
-                    self._service.events()
-                    .get(calendarId=self._calendar_id, eventId=event_id)
-                    .execute()
-                )
-                retry = self._service.events().patch(
-                    calendarId=self._calendar_id,
-                    eventId=event_id,
-                    body=body,
-                )
-                retry.headers["If-Match"] = fresh.get("etag", "")
-                return retry.execute()
-            log.error(
-                "_patch_event: HttpError %s for event=%s: %s",
-                exc.resp.status,
-                event_id,
-                exc,
-            )
-            raise
+            return self._default_capacity
 
     def _format_time(self, iso: str) -> str:
         try:
