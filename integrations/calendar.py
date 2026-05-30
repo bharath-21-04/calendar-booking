@@ -7,12 +7,14 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 import google.oauth2.service_account
-import googleapiclient.discovery
+from google.auth.transport.requests import AuthorizedSession
 
 from config.settings import get_settings
 from integrations.db import BookingDB
 
 log = logging.getLogger(__name__)
+
+_CALENDAR_API = "https://www.googleapis.com/calendar/v3"
 
 
 @dataclass
@@ -35,12 +37,35 @@ class CalendarClient:
                 scopes=self.SCOPES,
             )
         )
-        self._service = googleapiclient.discovery.build(
-            "calendar", "v3", credentials=credentials, cache_discovery=False
-        )
+        # Use requests-based AuthorizedSession instead of httplib2/googleapiclient
+        # to avoid [Errno 49] IPv6 binding failures on macOS.
+        self._session = AuthorizedSession(credentials)
         self._calendar_id = settings.google_calendar_id
         self._default_capacity = settings.class_capacity_default
         self._db = BookingDB()
+
+    def _get_event(self, event_id: str) -> dict:
+        url = f"{_CALENDAR_API}/calendars/{self._calendar_id}/events/{event_id}"
+        resp = self._session.get(url)
+        resp.raise_for_status()
+        return resp.json()
+
+    def _sync_description(self, class_id: str, current_description: str | None) -> None:
+        """PATCH the calendar event description with current bookings from the DB."""
+        try:
+            desc = json.loads(current_description) if current_description else {}
+        except (json.JSONDecodeError, ValueError):
+            desc = {}
+
+        bookings = self._db.get_bookings(class_id)
+        desc["bookings"] = [{"name": b["name"], "phone": b["phone"]} for b in bookings]
+
+        url = f"{_CALENDAR_API}/calendars/{self._calendar_id}/events/{class_id}"
+        resp = self._session.patch(url, json={"description": json.dumps(desc)})
+        resp.raise_for_status()
+        log.info(
+            "_sync_description: updated event=%s bookings=%d", class_id, len(bookings)
+        )
 
     def list_classes(self, date: str) -> list[ClassSlot]:
         time_min = f"{date}T08:00:00Z"
@@ -48,17 +73,18 @@ class CalendarClient:
         next_day = (dt + timedelta(days=1)).strftime("%Y-%m-%d")
         time_max = f"{next_day}T07:59:59Z"
 
-        result = (
-            self._service.events()
-            .list(
-                calendarId=self._calendar_id,
-                timeMin=time_min,
-                timeMax=time_max,
-                singleEvents=True,
-                orderBy="startTime",
-            )
-            .execute()
+        url = f"{_CALENDAR_API}/calendars/{self._calendar_id}/events"
+        resp = self._session.get(
+            url,
+            params={
+                "timeMin": time_min,
+                "timeMax": time_max,
+                "singleEvents": "true",
+                "orderBy": "startTime",
+            },
         )
+        resp.raise_for_status()
+        result = resp.json()
 
         slots = []
         for event in result.get("items", []):
@@ -79,20 +105,12 @@ class CalendarClient:
         return slots
 
     def check_availability(self, class_id: str) -> int:
-        event = (
-            self._service.events()
-            .get(calendarId=self._calendar_id, eventId=class_id)
-            .execute()
-        )
+        event = self._get_event(class_id)
         capacity = self._get_capacity(event.get("description"))
         return max(0, capacity - self._db.count(class_id))
 
     def book_class(self, class_id: str, name: str, phone: str) -> str:
-        event = (
-            self._service.events()
-            .get(calendarId=self._calendar_id, eventId=class_id)
-            .execute()
-        )
+        event = self._get_event(class_id)
         capacity = self._get_capacity(event.get("description"))
         booked = self._db.count(class_id)
 
@@ -111,6 +129,8 @@ class CalendarClient:
         except sqlite3.IntegrityError:
             raise ValueError(f"{name} already has a booking for this class.")
 
+        self._sync_description(class_id, event.get("description"))
+
         title = event.get("summary", "class")
         start = event.get("start", {}).get(
             "dateTime", event.get("start", {}).get("date", "")
@@ -128,15 +148,13 @@ class CalendarClient:
         return self.book_class(new_class_id, name, phone)
 
     def cancel_booking(self, class_id: str, name: str, phone: str) -> str:
-        event = (
-            self._service.events()
-            .get(calendarId=self._calendar_id, eventId=class_id)
-            .execute()
-        )
+        event = self._get_event(class_id)
 
         removed = self._db.remove(class_id, name, phone)
         if removed == 0:
             raise ValueError(f"No booking found for {name} / {phone}.")
+
+        self._sync_description(class_id, event.get("description"))
 
         title = event.get("summary", "class")
         start = event.get("start", {}).get(

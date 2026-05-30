@@ -65,13 +65,14 @@ def _normalize_date(date: str) -> str:
     if m:
         return f"{current_year}-{int(m.group(1)):02d}-{int(m.group(2)):02d}"
 
-    for fmt in ("%B %d %Y", "%b %d %Y", "%B %d", "%b %d"):
-        try:
-            dt = datetime.strptime(date, fmt)
-            year = dt.year if dt.year != 1900 else current_year
-            return f"{year}-{dt.month:02d}-{dt.day:02d}"
-        except ValueError:
-            continue
+    for fmt in ("%B %d, %Y", "%b %d, %Y", "%B %d %Y", "%b %d %Y", "%B %d", "%b %d"):
+        for candidate in (original.strip(), date.title()):
+            try:
+                dt = datetime.strptime(candidate, fmt)
+                year = dt.year if dt.year != 1900 else current_year
+                return f"{year}-{dt.month:02d}-{dt.day:02d}"
+            except ValueError:
+                continue
 
     log.warning("_normalize_date: could not parse %r, using as-is", original)
     return original

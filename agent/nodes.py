@@ -105,7 +105,17 @@ def agent_node(state: AgentState) -> dict:
     messages = state["messages"]
 
     if not messages or not isinstance(messages[0], SystemMessage):
-        messages = [SystemMessage(content=get_system_prompt())] + list(messages)
+        system_content = get_system_prompt()
+        caller_phone = state.get("caller_phone") or ""
+        caller_name = state.get("caller_name") or ""
+        if caller_phone:
+            system_content += (
+                "\n\nCALLER INFO — already captured from call metadata, do NOT ask for these:\n"
+                f"- Phone: {caller_phone}\n"
+            )
+            if caller_name:
+                system_content += f"- Name: {caller_name}\n"
+        messages = [SystemMessage(content=system_content)] + list(messages)
 
     try:
         ai_message = _model_with_tools.invoke(messages)
