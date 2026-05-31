@@ -30,6 +30,29 @@ _WEEKDAYS = {
 }
 
 
+def _validate_phone(phone: str) -> str | None:
+    """Return None if phone looks valid, or an error string if it's clearly invented."""
+    digits = re.sub(r"\D", "", phone)
+    if len(digits) < 10:
+        return (
+            "ERROR: the phone number looks incomplete. "
+            "Ask the caller for their full phone number, then try again."
+        )
+    # Strip leading country code 1 for 11-digit NANP numbers.
+    local = digits[1:] if (len(digits) == 11 and digits[0] == "1") else digits
+    if len(local) == 10:
+        area = local[0:3]  # NPA (area code)
+        exchange = local[3:6]  # NXX (exchange)
+        # 555 area code does not exist in NANP; 555 exchange is reserved.
+        # Both are fictional placeholder numbers commonly hallucinated by LLMs.
+        if area == "555" or exchange == "555":
+            return (
+                "ERROR: that phone number doesn't look real. "
+                "Please ask the caller to confirm their actual phone number."
+            )
+    return None
+
+
 def _normalize_date(date: str) -> str:
     original = date
     date = date.strip().lower()
@@ -153,6 +176,9 @@ def book_class(class_id: str, caller_name: str, caller_phone: str) -> str:
     """
     if not caller_name or not caller_phone:
         return "ERROR: caller name and phone number are required before booking. Ask the caller for both, then try again."
+    phone_err = _validate_phone(caller_phone)
+    if phone_err:
+        return phone_err
     try:
         confirmation = _calendar.book_class(class_id, caller_name, caller_phone)
         return confirmation
@@ -183,6 +209,9 @@ def reschedule_booking(
     """
     if not caller_name or not caller_phone:
         return "ERROR: caller name and phone number are required before rescheduling. Ask the caller for both, then try again."
+    phone_err = _validate_phone(caller_phone)
+    if phone_err:
+        return phone_err
     try:
         confirmation = _calendar.reschedule_booking(
             old_class_id, new_class_id, caller_name, caller_phone
@@ -213,6 +242,11 @@ def cancel_booking(class_id: str, caller_name: str, caller_phone: str) -> str:
     Returns:
         Confirmation string on success, or an error string if booking not found.
     """
+    if not caller_name or not caller_phone:
+        return "ERROR: caller name and phone number are required before cancelling. Ask the caller for both, then try again."
+    phone_err = _validate_phone(caller_phone)
+    if phone_err:
+        return phone_err
     try:
         confirmation = _calendar.cancel_booking(class_id, caller_name, caller_phone)
         return confirmation

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
@@ -78,36 +79,79 @@ _raw_tools_node = ToolNode(ALL_TOOLS)
 
 async def tools_node(state: AgentState, config: RunnableConfig) -> dict:
     last_ai = state["messages"][-1]
-    tool_names = [tc["name"] for tc in getattr(last_ai, "tool_calls", [])]
+    tool_calls = getattr(last_ai, "tool_calls", [])
+    tool_names = [tc["name"] for tc in tool_calls]
+
     log.info("── tools_node ── executing: %s", tool_names)
+    for tc in tool_calls:
+        log.info(
+            "  tool call | name=%s  args=%s",
+            tc["name"],
+            tc.get("args", {}),
+        )
+
+    t_tools = time.perf_counter()
     result = await _raw_tools_node.ainvoke(state, config=config)
-    log.info("── tools_node ── finished: %s", tool_names)
+    tools_ms = (time.perf_counter() - t_tools) * 1000
+
+    for msg in result.get("messages", []):
+        if isinstance(msg, ToolMessage):
+            log.info(
+                "  tool result | name=%s  content=%r",
+                msg.name,
+                str(msg.content)[:300],
+            )
+
+    log.info("── tools_node ── finished: %s  %.1fms", tool_names, tools_ms)
 
     caller_name = state.get("caller_name") or ""
-    if not caller_name and hasattr(last_ai, "tool_calls"):
+    caller_phone = state.get("caller_phone") or ""
+    if hasattr(last_ai, "tool_calls"):
         for tc in last_ai.tool_calls:
-            name = tc.get("args", {}).get("caller_name", "")
-            if name:
-                caller_name = name
-                log.info(
-                    "tools_node: captured caller_name=%r from tool %s", name, tc["name"]
-                )
-                break
+            args = tc.get("args", {})
+            if not caller_name:
+                name = args.get("caller_name", "")
+                if name:
+                    caller_name = name
+                    log.info(
+                        "tools_node: captured caller_name=%r from tool %s",
+                        name,
+                        tc["name"],
+                    )
+            if not caller_phone:
+                phone = args.get("caller_phone", "")
+                if phone:
+                    caller_phone = phone
+                    log.info(
+                        "tools_node: captured caller_phone=%r from tool %s",
+                        phone,
+                        tc["name"],
+                    )
 
     if caller_name and caller_name != state.get("caller_name"):
+        log.info("tools_node: updating state caller_name=%r", caller_name)
         result["caller_name"] = caller_name
+    if caller_phone and caller_phone != state.get("caller_phone"):
+        log.info("tools_node: updating state caller_phone=%r", caller_phone)
+        result["caller_phone"] = caller_phone
 
     return result
 
 
 def agent_node(state: AgentState) -> dict:
-    log.info("── agent_node ── (messages=%d)", len(state["messages"]))
+    caller_phone = state.get("caller_phone") or ""
+    caller_name = state.get("caller_name") or ""
+    log.info(
+        "── agent_node ── messages=%d  caller=%s  phone=%s",
+        len(state["messages"]),
+        caller_name or "(unknown)",
+        caller_phone or "(none)",
+    )
     messages = state["messages"]
 
-    if not messages or not isinstance(messages[0], SystemMessage):
+    building_system = not messages or not isinstance(messages[0], SystemMessage)
+    if building_system:
         system_content = get_system_prompt()
-        caller_phone = state.get("caller_phone") or ""
-        caller_name = state.get("caller_name") or ""
         if caller_phone:
             system_content += (
                 "\n\nCALLER INFO — already captured from call metadata, do NOT ask for these:\n"
@@ -116,10 +160,17 @@ def agent_node(state: AgentState) -> dict:
             if caller_name:
                 system_content += f"- Name: {caller_name}\n"
         messages = [SystemMessage(content=system_content)] + list(messages)
+        log.debug(
+            "agent_node: built system prompt (phone_injected=%s)", bool(caller_phone)
+        )
 
+    log.debug("agent_node: sending %d messages to LLM", len(messages))
+    t_llm = time.perf_counter()
     try:
         ai_message = _model_with_tools.invoke(messages)
     except Exception as exc:
+        llm_ms = (time.perf_counter() - t_llm) * 1000
+        log.error("agent_node: LLM error after %.1fms — %s", llm_ms, exc, exc_info=True)
         error_text = str(exc)
         if "500" in error_text or "Internal Server Error" in error_text:
             user_msg = (
@@ -129,12 +180,18 @@ def agent_node(state: AgentState) -> dict:
         else:
             user_msg = "Something went wrong on my end — please try again shortly."
         ai_message = AIMessage(content=user_msg)
-
-    if hasattr(ai_message, "tool_calls") and ai_message.tool_calls:
-        names = [tc["name"] for tc in ai_message.tool_calls]
-        log.info("agent_node: LLM requesting tools %s", names)
     else:
-        log.info("agent_node: LLM returning text reply (no tool calls)")
+        llm_ms = (time.perf_counter() - t_llm) * 1000
+        if hasattr(ai_message, "tool_calls") and ai_message.tool_calls:
+            names = [tc["name"] for tc in ai_message.tool_calls]
+            log.info("agent_node: LLM → tools %s  %.1fms", names, llm_ms)
+            for tc in ai_message.tool_calls:
+                log.debug(
+                    "  planned call | %s  args=%s", tc["name"], tc.get("args", {})
+                )
+        else:
+            preview = str(ai_message.content)[:120].replace("\n", " ")
+            log.info("agent_node: LLM → text reply  %.1fms  %r", llm_ms, preview)
 
     return {"messages": [ai_message]}
 
@@ -167,11 +224,19 @@ _TOOL_TOPIC_TITLES = {
 
 def finalize_node(state: AgentState) -> dict:
     log.info("── finalize_node ──")
+
+    # Already wrote to Sheets for this session — don't double-increment call_count.
+    if state.get("call_summary"):
+        log.info("finalize_node: already logged this session, skipping re-write")
+        return {}
+
     tool_names_used: set[str] = set()
     for msg in state["messages"]:
         if isinstance(msg, AIMessage) and msg.tool_calls:
             for tc in msg.tool_calls:
                 tool_names_used.add(tc["name"])
+
+    log.info("finalize_node: all tools used this session: %s", sorted(tool_names_used))
 
     if not (tool_names_used & _MEANINGFUL_TOOLS):
         log.info("finalize_node: no meaningful tools used, skipping sheet write")
@@ -179,6 +244,11 @@ def finalize_node(state: AgentState) -> dict:
 
     caller_name = state.get("caller_name") or ""
     caller_phone = state.get("caller_phone") or ""
+    log.debug(
+        "finalize_node: state has caller_name=%r  caller_phone=%r",
+        caller_name,
+        caller_phone,
+    )
     if not caller_name or not caller_phone:
         for msg in state["messages"]:
             if isinstance(msg, AIMessage) and msg.tool_calls:
@@ -197,6 +267,11 @@ def finalize_node(state: AgentState) -> dict:
                         caller_phone = caller_phone or tc["args"].get(
                             "caller_phone", ""
                         )
+        log.debug(
+            "finalize_node: resolved from tool args — caller_name=%r  caller_phone=%r",
+            caller_name,
+            caller_phone,
+        )
 
     phone = caller_phone or "unknown"
     priority = [
@@ -208,8 +283,49 @@ def finalize_node(state: AgentState) -> dict:
     ]
     raw_topic = next((t for t in priority if t in tool_names_used), "general")
     topic_title = _TOOL_TOPIC_TITLES.get(raw_topic, raw_topic.replace("_", " ").title())
-    summary = f"Tools used: {', '.join(sorted(tool_names_used & _MEANINGFUL_TOOLS))}"
 
+    # Build human-readable notes from actual tool results and explicit note args.
+    note_parts: list[str] = []
+
+    # 1. Explicit notes from log_caller_note / escalate_to_human args.
+    for msg in state["messages"]:
+        if isinstance(msg, AIMessage) and msg.tool_calls:
+            for tc in msg.tool_calls:
+                if tc["name"] == "log_caller_note":
+                    n = tc["args"].get("notes", "").strip()
+                    if n:
+                        note_parts.append(n)
+                elif tc["name"] == "escalate_to_human":
+                    r = tc["args"].get("reason", "").strip()
+                    if r:
+                        note_parts.append(f"Escalated: {r}")
+
+    # 2. Confirmation strings returned by booking/cancellation tools.
+    tool_call_ids = {
+        tc["id"]
+        for msg in state["messages"]
+        if isinstance(msg, AIMessage)
+        for tc in getattr(msg, "tool_calls", [])
+        if tc["name"] in {"book_class", "reschedule_booking", "cancel_booking"}
+    }
+    for msg in state["messages"]:
+        if (
+            isinstance(msg, ToolMessage)
+            and msg.tool_call_id in tool_call_ids
+            and msg.content
+            and not str(msg.content).startswith("ERROR")
+        ):
+            note_parts.append(str(msg.content).strip())
+
+    summary = "; ".join(note_parts) if note_parts else topic_title
+
+    log.info(
+        "finalize_node: writing to sheet | phone=%s  name=%r  topic=%r  summary=%r",
+        phone,
+        caller_name,
+        topic_title,
+        summary,
+    )
     try:
         _sheets.upsert_caller(
             phone=phone,

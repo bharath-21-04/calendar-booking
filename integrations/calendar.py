@@ -1,16 +1,15 @@
 from __future__ import annotations
 
-import json
 import logging
-import sqlite3
+import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import google.oauth2.service_account
 from google.auth.transport.requests import AuthorizedSession
 
 from config.settings import get_settings
-from integrations.db import BookingDB
 
 log = logging.getLogger(__name__)
 
@@ -27,6 +26,32 @@ class ClassSlot:
 
 
 class CalendarClient:
+    """
+    Google Calendar is the single source of truth for class availability and bookings.
+
+    Architecture — two event types, distinguished by extendedProperties.private.type:
+
+    CLASS events  (type=class):
+        summary:  "Reformer — 6 AM"
+        extendedProperties.private:
+            type     = "class"
+            capacity = "10"
+
+    BOOKING events  (type=booking):
+        summary:  "Booking: <name>"
+        extendedProperties.private:
+            type    = "booking"
+            classId = "<class_event_id>"
+            name    = "<caller name>"
+            phone   = "<E.164 phone>"
+        start/end: same time window as the parent class
+
+    Availability  = capacity - count(booking events where classId = class_id)
+    Book          = create a booking event
+    Cancel        = delete the matching booking event
+    No JSON is stored in event descriptions; no local database is used.
+    """
+
     SCOPES = ["https://www.googleapis.com/auth/calendar"]
 
     def __init__(self) -> None:
@@ -37,142 +62,263 @@ class CalendarClient:
                 scopes=self.SCOPES,
             )
         )
-        # Use requests-based AuthorizedSession instead of httplib2/googleapiclient
-        # to avoid [Errno 49] IPv6 binding failures on macOS.
         self._session = AuthorizedSession(credentials)
-        self._calendar_id = settings.google_calendar_id
+        self._cal_id = settings.google_calendar_id
         self._default_capacity = settings.class_capacity_default
-        self._db = BookingDB()
+        self._tz = ZoneInfo(settings.studio_timezone)
+        self._tz_name = settings.studio_timezone
+
+    # -- low-level helpers ----------------------------------------------------
+
+    def _events_url(self) -> str:
+        return f"{_CALENDAR_API}/calendars/{self._cal_id}/events"
+
+    def _event_url(self, event_id: str) -> str:
+        return f"{_CALENDAR_API}/calendars/{self._cal_id}/events/{event_id}"
+
+    def _list_events(self, params: list[tuple[str, str]]) -> list[dict]:
+        """Page through events.list using a list-of-tuples for repeated params."""
+        all_events: list[dict] = []
+        page_token: str | None = None
+        while True:
+            p = params.copy()
+            if page_token:
+                p.append(("pageToken", page_token))
+            resp = self._session.get(self._events_url(), params=p)
+            resp.raise_for_status()
+            data = resp.json()
+            all_events.extend(data.get("items", []))
+            page_token = data.get("nextPageToken")
+            if not page_token:
+                break
+        return all_events
 
     def _get_event(self, event_id: str) -> dict:
-        url = f"{_CALENDAR_API}/calendars/{self._calendar_id}/events/{event_id}"
-        resp = self._session.get(url)
+        resp = self._session.get(self._event_url(event_id))
         resp.raise_for_status()
         return resp.json()
 
-    def _sync_description(self, class_id: str, current_description: str | None) -> None:
-        """PATCH the calendar event description with current bookings from the DB."""
-        try:
-            desc = json.loads(current_description) if current_description else {}
-        except (json.JSONDecodeError, ValueError):
-            desc = {}
-
-        bookings = self._db.get_bookings(class_id)
-        desc["bookings"] = [{"name": b["name"], "phone": b["phone"]} for b in bookings]
-
-        url = f"{_CALENDAR_API}/calendars/{self._calendar_id}/events/{class_id}"
-        resp = self._session.patch(url, json={"description": json.dumps(desc)})
+    def _create_event(self, body: dict) -> dict:
+        resp = self._session.post(self._events_url(), json=body)
         resp.raise_for_status()
-        log.info(
-            "_sync_description: updated event=%s bookings=%d", class_id, len(bookings)
+        return resp.json()
+
+    def _delete_event(self, event_id: str) -> None:
+        resp = self._session.delete(self._event_url(event_id))
+        resp.raise_for_status()
+
+    def _format_time(self, iso: str) -> str:
+        try:
+            dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+            return dt.strftime("%-I:%M %p on %a %b %-d")
+        except Exception:
+            return iso
+
+    # -- booking sub-event helpers --------------------------------------------
+
+    def _get_booking_events(self, class_id: str) -> list[dict]:
+        """Return all booking sub-events linked to a class."""
+        return self._list_events(
+            [
+                ("privateExtendedProperty", f"classId={class_id}"),
+                ("privateExtendedProperty", "type=booking"),
+            ]
         )
+
+    def _create_booking_event(
+        self,
+        class_id: str,
+        name: str,
+        phone: str,
+        start_iso: str,
+        end_iso: str,
+        timezone: str,
+        class_title: str,
+    ) -> str:
+        """Create a booking sub-event and return its event ID."""
+        body = {
+            "summary": f"Booking: {name}",
+            "description": f"{class_title} — {name} ({phone})",
+            "start": {"dateTime": start_iso, "timeZone": timezone},
+            "end": {"dateTime": end_iso, "timeZone": timezone},
+            "extendedProperties": {
+                "private": {
+                    "type": "booking",
+                    "classId": class_id,
+                    "name": name,
+                    "phone": phone,
+                }
+            },
+        }
+        event = self._create_event(body)
+        log.info(
+            "calendar CREATE booking | id=%s  class=%s  name=%r  phone=%s",
+            event["id"],
+            class_id,
+            name,
+            phone,
+        )
+        return event["id"]
+
+    # -- public API -----------------------------------------------------------
+
+    def create_event(
+        self,
+        title: str,
+        start_iso: str,
+        end_iso: str,
+        timezone: str,
+        capacity: int,
+        pre_bookings: list[dict] | None = None,
+    ) -> str:
+        """Create a class event (and optional pre-bookings). Returns the class event ID."""
+        body = {
+            "summary": title,
+            "start": {"dateTime": start_iso, "timeZone": timezone},
+            "end": {"dateTime": end_iso, "timeZone": timezone},
+            "extendedProperties": {
+                "private": {
+                    "type": "class",
+                    "capacity": str(capacity),
+                }
+            },
+        }
+        event = self._create_event(body)
+        class_id = event["id"]
+        log.info(
+            "calendar CREATE class | id=%s  title=%r  capacity=%d  pre_booked=%d",
+            class_id,
+            title,
+            capacity,
+            len(pre_bookings or []),
+        )
+        for booking in pre_bookings or []:
+            self._create_booking_event(
+                class_id,
+                booking["name"],
+                booking["phone"],
+                start_iso,
+                end_iso,
+                timezone,
+                title,
+            )
+        return class_id
 
     def list_classes(self, date: str) -> list[ClassSlot]:
-        time_min = f"{date}T08:00:00Z"
-        dt = datetime.strptime(date, "%Y-%m-%d")
-        next_day = (dt + timedelta(days=1)).strftime("%Y-%m-%d")
-        time_max = f"{next_day}T07:59:59Z"
+        """Return ClassSlot list for a given date (YYYY-MM-DD)."""
+        d = datetime.strptime(date, "%Y-%m-%d")
+        day_start = datetime(d.year, d.month, d.day, tzinfo=self._tz)
+        t_min = day_start.isoformat()
+        t_max = (day_start + timedelta(days=1)).isoformat()
 
-        url = f"{_CALENDAR_API}/calendars/{self._calendar_id}/events"
-        resp = self._session.get(
-            url,
-            params={
-                "timeMin": time_min,
-                "timeMax": time_max,
-                "singleEvents": "true",
-                "orderBy": "startTime",
-            },
+        # Two API calls: class events + booking events for the whole day.
+        class_events = self._list_events(
+            [
+                ("timeMin", t_min),
+                ("timeMax", t_max),
+                ("singleEvents", "true"),
+                ("orderBy", "startTime"),
+                ("privateExtendedProperty", "type=class"),
+            ]
         )
-        resp.raise_for_status()
-        result = resp.json()
+        booking_events = self._list_events(
+            [
+                ("timeMin", t_min),
+                ("timeMax", t_max),
+                ("singleEvents", "true"),
+                ("privateExtendedProperty", "type=booking"),
+            ]
+        )
 
-        slots = []
-        for event in result.get("items", []):
-            capacity = self._get_capacity(event.get("description"))
-            booked = self._db.count(event["id"])
-            start = event.get("start", {}).get(
-                "dateTime", event.get("start", {}).get("date", "")
+        # Count bookings per class_id.
+        booking_counts: dict[str, int] = {}
+        for b in booking_events:
+            cid = b.get("extendedProperties", {}).get("private", {}).get("classId")
+            if cid:
+                booking_counts[cid] = booking_counts.get(cid, 0) + 1
+
+        slots: list[ClassSlot] = []
+        for ev in class_events:
+            ext = ev.get("extendedProperties", {}).get("private", {})
+            capacity = int(ext.get("capacity", self._default_capacity))
+            class_id = ev["id"]
+            booked = booking_counts.get(class_id, 0)
+            start_raw = ev.get("start", {}).get(
+                "dateTime", ev.get("start", {}).get("date", "")
             )
             slots.append(
                 ClassSlot(
-                    class_id=event["id"],
-                    title=event.get("summary", "Class"),
-                    time=start,
-                    spots_left=max(0, capacity - booked),
+                    class_id=class_id,
+                    title=ev.get("summary", "Class"),
+                    time=self._format_time(start_raw),
                     capacity=capacity,
+                    spots_left=max(0, capacity - booked),
                 )
             )
         return slots
 
     def check_availability(self, class_id: str) -> int:
-        event = self._get_event(class_id)
-        capacity = self._get_capacity(event.get("description"))
-        return max(0, capacity - self._db.count(class_id))
+        """Return spots remaining for a class."""
+        ev = self._get_event(class_id)
+        ext = ev.get("extendedProperties", {}).get("private", {})
+        capacity = int(ext.get("capacity", self._default_capacity))
+        booked = len(self._get_booking_events(class_id))
+        return max(0, capacity - booked)
 
     def book_class(self, class_id: str, name: str, phone: str) -> str:
-        event = self._get_event(class_id)
-        capacity = self._get_capacity(event.get("description"))
-        booked = self._db.count(class_id)
+        """Book a class for a caller. Returns a confirmation string."""
+        class_ev = self._get_event(class_id)
+        ext = class_ev.get("extendedProperties", {}).get("private", {})
+        capacity = int(ext.get("capacity", self._default_capacity))
 
-        log.info(
-            "book_class: event=%s capacity=%d booked=%d",
-            class_id,
-            capacity,
-            booked,
+        existing = self._get_booking_events(class_id)
+        if len(existing) >= capacity:
+            raise ValueError("Sorry, that class is fully booked.")
+        for b in existing:
+            if b.get("extendedProperties", {}).get("private", {}).get("phone") == phone:
+                return f"You're already booked for {class_ev.get('summary', 'that class')}."
+
+        start_iso = class_ev["start"].get("dateTime", class_ev["start"].get("date", ""))
+        end_iso = class_ev["end"].get("dateTime", class_ev["end"].get("date", ""))
+        timezone = class_ev["start"].get("timeZone", self._tz_name)
+        title = class_ev.get("summary", "Class")
+
+        self._create_booking_event(
+            class_id, name, phone, start_iso, end_iso, timezone, title
         )
-
-        if booked >= capacity:
-            raise ValueError("Class is fully booked.")
-
-        try:
-            self._db.add(class_id, name, phone)
-        except sqlite3.IntegrityError:
-            raise ValueError(f"{name} already has a booking for this class.")
-
-        self._sync_description(class_id, event.get("description"))
-
-        title = event.get("summary", "class")
-        start = event.get("start", {}).get(
-            "dateTime", event.get("start", {}).get("date", "")
-        )
-        return f"Booked: {title} at {self._format_time(start)}"
-
-    def reschedule_booking(
-        self,
-        old_class_id: str,
-        new_class_id: str,
-        name: str,
-        phone: str,
-    ) -> str:
-        self.cancel_booking(old_class_id, name, phone)
-        return self.book_class(new_class_id, name, phone)
+        return f"You're all set! {name} is booked for {title} at {self._format_time(start_iso)}."
 
     def cancel_booking(self, class_id: str, name: str, phone: str) -> str:
-        event = self._get_event(class_id)
-
-        removed = self._db.remove(class_id, name, phone)
-        if removed == 0:
-            raise ValueError(f"No booking found for {name} / {phone}.")
-
-        self._sync_description(class_id, event.get("description"))
-
-        title = event.get("summary", "class")
-        start = event.get("start", {}).get(
-            "dateTime", event.get("start", {}).get("date", "")
+        """Cancel a booking. Returns a confirmation string."""
+        bookings = self._get_booking_events(class_id)
+        target = next(
+            (
+                b
+                for b in bookings
+                if b.get("extendedProperties", {}).get("private", {}).get("phone")
+                == phone
+            ),
+            None,
         )
-        return f"Cancelled: {title} at {self._format_time(start)}"
+        if target is None:
+            raise ValueError(f"No booking found for {phone} in that class.")
 
-    def _get_capacity(self, description: str | None) -> int:
-        if not description:
-            return self._default_capacity
-        try:
-            return json.loads(description).get("capacity", self._default_capacity)
-        except (json.JSONDecodeError, ValueError):
-            return self._default_capacity
+        self._delete_event(target["id"])
+        log.info(
+            "calendar DELETE booking | id=%s  class=%s  phone=%s",
+            target["id"],
+            class_id,
+            phone,
+        )
 
-    def _format_time(self, iso: str) -> str:
-        try:
-            dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
-            return dt.strftime("%I:%M %p on %a %b %-d")
-        except Exception:
-            return iso
+        class_ev = self._get_event(class_id)
+        title = class_ev.get("summary", "Class")
+        start_iso = class_ev["start"].get("dateTime", class_ev["start"].get("date", ""))
+        return f"Done! Your booking for {title} at {self._format_time(start_iso)} has been cancelled."
+
+    def reschedule_booking(
+        self, old_class_id: str, new_class_id: str, name: str, phone: str
+    ) -> str:
+        """Move a booking from one class to another."""
+        self.cancel_booking(old_class_id, name, phone)
+        return self.book_class(new_class_id, name, phone)

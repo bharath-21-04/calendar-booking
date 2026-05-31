@@ -66,29 +66,32 @@ class SheetsClient:
         email: str = "",
     ) -> None:
         now = datetime.now(timezone.utc).isoformat()
-        existing = self.get_caller(phone)
+        # Single get_all_records() call covers both lookup and row-index resolution.
+        records = self._ws.get_all_records()
+        row_index: int | None = None
+        existing_row: dict | None = None
+        for i, r in enumerate(records):
+            if str(r.get("phone")) == phone:
+                row_index = i + 2  # 1-based index, skip header row
+                existing_row = r
+                break
 
-        if existing is not None:
-            records = self._ws.get_all_records()
-            row_index = next(
-                (i + 2 for i, r in enumerate(records) if str(r.get("phone")) == phone),
-                None,
+        if existing_row is not None and row_index is not None:
+            existing = self._row_to_record(existing_row)
+            updated = CallerRecord(
+                phone=phone,
+                name=name or existing.name,
+                email=email or existing.email,
+                first_seen=existing.first_seen,
+                last_seen=now,
+                call_count=existing.call_count + 1,
+                last_topic=topic,
+                notes=notes,
             )
-            if row_index is not None:
-                updated = CallerRecord(
-                    phone=phone,
-                    name=name or existing.name,
-                    email=email or existing.email,
-                    first_seen=existing.first_seen,
-                    last_seen=now,
-                    call_count=existing.call_count + 1,
-                    last_topic=topic,
-                    notes=notes,
-                )
-                self._ws.update(
-                    f"A{row_index}:H{row_index}",
-                    [self._record_to_row(updated)],
-                )
+            self._ws.update(
+                f"A{row_index}:H{row_index}",
+                [self._record_to_row(updated)],
+            )
         else:
             new_record = CallerRecord(
                 phone=phone,

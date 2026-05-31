@@ -1,10 +1,8 @@
 from __future__ import annotations
 
-import json
 from datetime import date, datetime, timedelta
 
 from integrations.calendar import CalendarClient
-from integrations.db import BookingDB
 from config.settings import get_settings
 
 CLASS_TYPES = ["Reformer", "Mat", "Tower"]
@@ -25,14 +23,15 @@ DAY_OFFSETS = [1, 1, 1, 1, 1, 1, 2, 2, 3, 4]
 
 
 def _make_fake_bookings(count: int) -> list[dict]:
+    # Use 415 area code (real NANP area) to avoid the 555-block in _validate_phone.
     return [
-        {"name": f"Test User {i+1}", "phone": f"+1555000{i:04d}"} for i in range(count)
+        {"name": f"Test User {i + 1}", "phone": f"+14150000{i:04d}"}
+        for i in range(count)
     ]
 
 
 def seed() -> None:
     client = CalendarClient()
-    db = BookingDB()
     settings = get_settings()
     today = date.today()
 
@@ -52,31 +51,18 @@ def seed() -> None:
             print(f"[seed] Skipping (exists): {title} on {event_date}")
             continue
 
-        event_body = {
-            "summary": title,
-            "description": json.dumps({"capacity": capacity}),
-            "start": {
-                "dateTime": start_dt.isoformat(),
-                "timeZone": settings.studio_timezone,
-            },
-            "end": {
-                "dateTime": end_dt.isoformat(),
-                "timeZone": settings.studio_timezone,
-            },
-        }
-
-        created = (
-            client._service.events()
-            .insert(calendarId=settings.google_calendar_id, body=event_body)
-            .execute()
+        pre_bookings = _make_fake_bookings(pre_booked)
+        event_id = client.create_event(
+            title=title,
+            start_iso=start_dt.isoformat(),
+            end_iso=end_dt.isoformat(),
+            timezone=settings.studio_timezone,
+            capacity=capacity,
+            pre_bookings=pre_bookings,
         )
-        class_id = created["id"]
-
-        for booking in _make_fake_bookings(pre_booked):
-            db.add(class_id, booking["name"], booking["phone"])
 
         status = "FULL" if pre_booked >= capacity else f"{capacity - pre_booked} spots"
-        print(f"[seed] Created: {title} on {event_date} ({status})")
+        print(f"[seed] Created: {title} on {event_date} — {status}  (id={event_id})")
 
     print("[seed] Done.")
 

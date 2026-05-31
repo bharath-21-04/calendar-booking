@@ -34,16 +34,25 @@ class ChatResponse(BaseModel):
 
 @router.post("/chat", response_model=ChatResponse, tags=["Chat"])
 async def chat(request: ChatRequest) -> ChatResponse:
-    input_state: AgentState = {
-        "messages": [{"role": "user", "content": request.message}],
-        "caller_phone": request.phone or "",
-        "caller_name": "",
-        "session_id": request.session_id,
-        "handoff": False,
-        "call_summary": "",
-    }
-
     config = {"configurable": {"thread_id": request.session_id}}
+    existing = graph.get_state(config)
+    is_first_turn = not existing.values
+
+    if is_first_turn:
+        input_state: AgentState = {
+            "messages": [{"role": "user", "content": request.message}],
+            "caller_phone": request.phone or "",
+            "caller_name": "",
+            "session_id": request.session_id,
+            "handoff": False,
+            "call_summary": "",
+        }
+    else:
+        input_state = {  # type: ignore[assignment]
+            "messages": [{"role": "user", "content": request.message}],
+            "caller_phone": request.phone or "",
+            "session_id": request.session_id,
+        }
 
     result = await graph.ainvoke(input_state, config=config)
 
