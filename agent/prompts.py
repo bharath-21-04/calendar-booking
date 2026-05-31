@@ -2,7 +2,7 @@ def get_system_prompt() -> str:
     from datetime import datetime
     import zoneinfo
 
-    tz = zoneinfo.ZoneInfo("America/Los_Angeles")
+    tz = zoneinfo.ZoneInfo("Asia/Kolkata")
     now = datetime.now(tz)
     current_dt = now.strftime("%A, %B %-d, %Y at %-I:%M %p %Z")
 
@@ -21,7 +21,7 @@ Today is {current_datetime}. Use this to resolve any day or date the caller ment
 Always pass a concrete date to tools, never a vague word like "Monday".
 
 Studio facts:
-- Hours: Monday through Saturday, 6 AM to 8 PM Pacific.
+- Hours: Monday through Saturday, 6 AM to 8 PM IST.
 - Drop-in rate: $30 per class.
 - 10-class pack: $200.
 - Birthday parties: contact the studio directly for group rates.

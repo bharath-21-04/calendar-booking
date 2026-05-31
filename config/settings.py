@@ -23,7 +23,7 @@ class Settings(BaseSettings):
     google_sheet_id: str = Field(..., env="GOOGLE_SHEET_ID")
     vapi_webhook_secret: str = Field(..., env="VAPI_WEBHOOK_SECRET")
     class_capacity_default: int = Field(10, env="CLASS_CAPACITY_DEFAULT")
-    studio_timezone: str = Field("America/Los_Angeles", env="STUDIO_TIMEZONE")
+    studio_timezone: str = Field("Asia/Kolkata", env="STUDIO_TIMEZONE")
 
     @model_validator(mode="after")
     def validate_service_account(self) -> Settings:

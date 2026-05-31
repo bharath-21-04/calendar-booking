@@ -270,7 +270,7 @@ def get_studio_info(topic: str) -> str:
         Human-readable studio information string.
     """
     info_map = {
-        "hours": "We're open Monday through Saturday, 6 AM to 8 PM Pacific.",
+        "hours": "We're open Monday through Saturday, 6 AM to 8 PM IST.",
         "pricing": "Drop-in classes are $30, and a 10-class pack is $200.",
         "drop_in": "Drop-ins are welcome at $30 per class — just show up a few minutes early.",
         "birthday_party": "We do offer birthday party bookings — please contact the studio directly for group rates.",

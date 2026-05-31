@@ -137,8 +137,8 @@ class CalendarClient:
     ) -> str:
         """Create a booking sub-event and return its event ID."""
         body = {
-            "summary": f"Booking: {name}",
-            "description": f"{class_title} — {name} ({phone})",
+            "summary": f"{name} | {class_title}",
+            "description": f"Name:  {name}\nPhone: {phone}\nClass: {class_title}",
             "start": {"dateTime": start_iso, "timeZone": timezone},
             "end": {"dateTime": end_iso, "timeZone": timezone},
             "extendedProperties": {
@@ -159,6 +159,27 @@ class CalendarClient:
             phone,
         )
         return event["id"]
+
+    def _refresh_class_description(self, class_id: str, capacity: int) -> None:
+        """Patch the class event description with a human-readable roster."""
+        bookings = self._get_booking_events(class_id)
+        names = [
+            b.get("extendedProperties", {}).get("private", {}).get("name", "?")
+            for b in bookings
+        ]
+        booked = len(names)
+        roster = ", ".join(names) if names else "(none yet)"
+        desc = f"Capacity: {capacity}  |  Booked: {booked}/{capacity}\nRoster: {roster}"
+        resp = self._session.patch(
+            self._event_url(class_id), json={"description": desc}
+        )
+        resp.raise_for_status()
+        log.info(
+            "calendar PATCH class desc | id=%s  booked=%d/%d",
+            class_id,
+            booked,
+            capacity,
+        )
 
     # -- public API -----------------------------------------------------------
 
@@ -286,6 +307,7 @@ class CalendarClient:
         self._create_booking_event(
             class_id, name, phone, start_iso, end_iso, timezone, title
         )
+        self._refresh_class_description(class_id, capacity)
         return f"You're all set! {name} is booked for {title} at {self._format_time(start_iso)}."
 
     def cancel_booking(self, class_id: str, name: str, phone: str) -> str:
@@ -312,6 +334,10 @@ class CalendarClient:
         )
 
         class_ev = self._get_event(class_id)
+        ext = class_ev.get("extendedProperties", {}).get("private", {})
+        capacity = int(ext.get("capacity", self._default_capacity))
+        self._refresh_class_description(class_id, capacity)
+
         title = class_ev.get("summary", "Class")
         start_iso = class_ev["start"].get("dateTime", class_ev["start"].get("date", ""))
         return f"Done! Your booking for {title} at {self._format_time(start_iso)} has been cancelled."
