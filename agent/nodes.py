@@ -135,6 +135,11 @@ async def tools_node(state: AgentState, config: RunnableConfig) -> dict:
         log.info("tools_node: updating state caller_phone=%r", caller_phone)
         result["caller_phone"] = caller_phone
 
+    # Track escalation in state so downstream nodes and logs can see it
+    if "escalate_to_human" in tool_names:
+        log.info("tools_node: escalation detected — marking handoff=True")
+        result["handoff"] = True
+
     return result
 
 
@@ -160,11 +165,14 @@ def agent_node(state: AgentState) -> dict:
             if caller_name:
                 system_content += f"- Name: {caller_name}\n"
         messages = [SystemMessage(content=system_content)] + list(messages)
-        log.debug(
-            "agent_node: built system prompt (phone_injected=%s)", bool(caller_phone)
+        log.info(
+            "agent_node: system prompt built | phone_injected=%s  name_injected=%s  prompt_tail=%r",
+            bool(caller_phone),
+            bool(caller_name),
+            system_content[-200:].replace("\n", " "),
         )
 
-    log.debug("agent_node: sending %d messages to LLM", len(messages))
+    log.info("agent_node: sending %d messages to LLM", len(messages))
     t_llm = time.perf_counter()
     try:
         ai_message = _model_with_tools.invoke(messages)
@@ -186,9 +194,7 @@ def agent_node(state: AgentState) -> dict:
             names = [tc["name"] for tc in ai_message.tool_calls]
             log.info("agent_node: LLM → tools %s  %.1fms", names, llm_ms)
             for tc in ai_message.tool_calls:
-                log.debug(
-                    "  planned call | %s  args=%s", tc["name"], tc.get("args", {})
-                )
+                log.info("  planned call | %s  args=%s", tc["name"], tc.get("args", {}))
         else:
             preview = str(ai_message.content)[:120].replace("\n", " ")
             log.info("agent_node: LLM → text reply  %.1fms  %r", llm_ms, preview)
@@ -244,7 +250,7 @@ def finalize_node(state: AgentState) -> dict:
 
     caller_name = state.get("caller_name") or ""
     caller_phone = state.get("caller_phone") or ""
-    log.debug(
+    log.info(
         "finalize_node: state has caller_name=%r  caller_phone=%r",
         caller_name,
         caller_phone,
@@ -267,7 +273,7 @@ def finalize_node(state: AgentState) -> dict:
                         caller_phone = caller_phone or tc["args"].get(
                             "caller_phone", ""
                         )
-        log.debug(
+        log.info(
             "finalize_node: resolved from tool args — caller_name=%r  caller_phone=%r",
             caller_name,
             caller_phone,

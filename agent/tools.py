@@ -38,18 +38,6 @@ def _validate_phone(phone: str) -> str | None:
             "ERROR: the phone number looks incomplete. "
             "Ask the caller for their full phone number, then try again."
         )
-    # Strip leading country code 1 for 11-digit NANP numbers.
-    local = digits[1:] if (len(digits) == 11 and digits[0] == "1") else digits
-    if len(local) == 10:
-        area = local[0:3]  # NPA (area code)
-        exchange = local[3:6]  # NXX (exchange)
-        # 555 area code does not exist in NANP; 555 exchange is reserved.
-        # Both are fictional placeholder numbers commonly hallucinated by LLMs.
-        if area == "555" or exchange == "555":
-            return (
-                "ERROR: that phone number doesn't look real. "
-                "Please ask the caller to confirm their actual phone number."
-            )
     return None
 
 
@@ -117,9 +105,12 @@ def list_upcoming_classes(date: str) -> str:
         Human-readable summary of classes and open spots.
         Example: "We have a Reformer at 6 AM with 4 spots, Mat at 9 AM with 8 spots."
     """
+    log.info("TOOL list_upcoming_classes | raw_date=%r", date)
     try:
         date = _normalize_date(date)
+        log.info("TOOL list_upcoming_classes | normalized=%r", date)
         slots = _calendar.list_classes(date)
+        log.info("TOOL list_upcoming_classes | found %d slots", len(slots))
         if not slots:
             return "There are no classes scheduled for that day."
         parts = []
@@ -148,8 +139,10 @@ def check_class_availability(class_id: str) -> str:
         Human-readable availability string.
         Example: "That class has 3 spots left." or "That class is fully booked."
     """
+    log.info("TOOL check_class_availability | class_id=%r", class_id)
     try:
         spots = _calendar.check_availability(class_id)
+        log.info("TOOL check_class_availability | spots_left=%d", spots)
         if spots == 0:
             return "That class is fully booked."
         label = "spot" if spots == 1 else "spots"
@@ -174,6 +167,12 @@ def book_class(class_id: str, caller_name: str, caller_phone: str) -> str:
         Confirmation string on success, or an error string if fully booked.
         Example: "You're all set for Reformer at 6 PM on Monday June 1."
     """
+    log.info(
+        "TOOL book_class | class_id=%r  name=%r  phone=%r",
+        class_id,
+        caller_name,
+        caller_phone,
+    )
     if not caller_name or not caller_phone:
         return "ERROR: caller name and phone number are required before booking. Ask the caller for both, then try again."
     phone_err = _validate_phone(caller_phone)
@@ -181,8 +180,10 @@ def book_class(class_id: str, caller_name: str, caller_phone: str) -> str:
         return phone_err
     try:
         confirmation = _calendar.book_class(class_id, caller_name, caller_phone)
+        log.info("TOOL book_class | success: %r", confirmation)
         return confirmation
     except ValueError as exc:
+        log.warning("TOOL book_class | ValueError: %s", exc)
         return str(exc)
     except Exception as exc:
         log.error("book_class failed for event %s: %s", class_id, exc, exc_info=True)
@@ -207,6 +208,13 @@ def reschedule_booking(
     Returns:
         Confirmation string on success, or an error string on failure.
     """
+    log.info(
+        "TOOL reschedule_booking | old=%r  new=%r  name=%r  phone=%r",
+        old_class_id,
+        new_class_id,
+        caller_name,
+        caller_phone,
+    )
     if not caller_name or not caller_phone:
         return "ERROR: caller name and phone number are required before rescheduling. Ask the caller for both, then try again."
     phone_err = _validate_phone(caller_phone)
@@ -216,8 +224,10 @@ def reschedule_booking(
         confirmation = _calendar.reschedule_booking(
             old_class_id, new_class_id, caller_name, caller_phone
         )
+        log.info("TOOL reschedule_booking | success: %r", confirmation)
         return confirmation
     except ValueError as exc:
+        log.warning("TOOL reschedule_booking | ValueError: %s", exc)
         return str(exc)
     except Exception as exc:
         log.error(
@@ -242,6 +252,12 @@ def cancel_booking(class_id: str, caller_name: str, caller_phone: str) -> str:
     Returns:
         Confirmation string on success, or an error string if booking not found.
     """
+    log.info(
+        "TOOL cancel_booking | class_id=%r  name=%r  phone=%r",
+        class_id,
+        caller_name,
+        caller_phone,
+    )
     if not caller_name or not caller_phone:
         return "ERROR: caller name and phone number are required before cancelling. Ask the caller for both, then try again."
     phone_err = _validate_phone(caller_phone)
@@ -249,8 +265,10 @@ def cancel_booking(class_id: str, caller_name: str, caller_phone: str) -> str:
         return phone_err
     try:
         confirmation = _calendar.cancel_booking(class_id, caller_name, caller_phone)
+        log.info("TOOL cancel_booking | success: %r", confirmation)
         return confirmation
     except ValueError as exc:
+        log.warning("TOOL cancel_booking | ValueError: %s", exc)
         return str(exc)
     except Exception as exc:
         log.error(
@@ -269,6 +287,7 @@ def get_studio_info(topic: str) -> str:
     Returns:
         Human-readable studio information string.
     """
+    log.info("TOOL get_studio_info | topic=%r", topic)
     info_map = {
         "hours": "We're open Monday through Saturday, 6 AM to 8 PM IST.",
         "pricing": "Drop-in classes are $30, and a 10-class pack is $200.",
@@ -276,7 +295,9 @@ def get_studio_info(topic: str) -> str:
         "birthday_party": "We do offer birthday party bookings — please contact the studio directly for group rates.",
         "general": "Solstice Pilates is open Monday through Saturday, 6 AM to 8 PM. Drop-ins are $30.",
     }
-    return info_map.get(topic, info_map["general"])
+    result = info_map.get(topic, info_map["general"])
+    log.info("TOOL get_studio_info | returning info for topic=%r", topic)
+    return result
 
 
 @tool
@@ -297,16 +318,27 @@ def log_caller_note(
     Returns:
         "Logged." on success, or an empty string on failure.
     """
+    log.info(
+        "TOOL log_caller_note | phone=%r  name=%r  topic=%r",
+        caller_phone,
+        caller_name,
+        topic,
+    )
     try:
         _sheets.upsert_caller(caller_phone, caller_name, topic, notes)
+        log.info("TOOL log_caller_note | saved to sheets")
         return "Logged."
-    except Exception:
+    except Exception as exc:
+        log.error("log_caller_note failed: %s", exc, exc_info=True)
         return ""
 
 
 @tool
 def escalate_to_human(reason: str, caller_name: str, caller_phone: str) -> str:
-    """Hand off to a human team member and end the call gracefully.
+    """Escalate this call by saving details to the CRM so the studio can follow up.
+
+    DO NOT hang up or transfer the call. After calling this tool, tell the caller
+    the studio will call them back and continue the conversation normally.
 
     IMPORTANT: Before calling this tool you MUST have the caller's name and
     phone number. If you do not have them, ask for them first.
@@ -317,8 +349,14 @@ def escalate_to_human(reason: str, caller_name: str, caller_phone: str) -> str:
         caller_phone: Caller's phone number (any format is fine).
 
     Returns:
-        Goodbye message to speak to the caller before hanging up.
+        Internal status string for the LLM (not spoken to the caller).
     """
+    log.info(
+        "TOOL escalate_to_human | name=%r  phone=%r  reason=%r",
+        caller_name,
+        caller_phone,
+        reason,
+    )
     try:
         _sheets.upsert_caller(
             phone=caller_phone or "unknown",
@@ -327,7 +365,7 @@ def escalate_to_human(reason: str, caller_name: str, caller_phone: str) -> str:
             notes=reason,
         )
         log.info(
-            "escalate_to_human: logged %s / %s reason=%r",
+            "TOOL escalate_to_human | saved to CRM | name=%s  phone=%s  reason=%r",
             caller_name,
             caller_phone,
             reason,
@@ -337,8 +375,10 @@ def escalate_to_human(reason: str, caller_name: str, caller_phone: str) -> str:
 
     name_part = f" {caller_name.split()[0]}" if caller_name else ""
     return (
-        f"Thank you{name_part}. I've noted your details and a team member will "
-        "reach out to you shortly. Have a wonderful day — goodbye!"
+        f"Saved.{name_part}'s details ({caller_phone}) and reason ({reason!r}) are "
+        "logged. Tell the caller: a Solstice Pilates team member will call them back "
+        "shortly. Do NOT say goodbye or hang up — keep the call active and ask if "
+        "there is anything else you can help with."
     )
 
 

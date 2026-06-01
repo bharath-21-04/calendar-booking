@@ -16,11 +16,8 @@ def _route_after_agent(state: AgentState) -> str:
 
 
 def _route_after_tools(state: AgentState) -> str:
-    for msg in reversed(state["messages"]):
-        if isinstance(msg, ToolMessage) and msg.name == "escalate_to_human":
-            return "handoff_node"
-        if isinstance(msg, ToolMessage):
-            break
+    if state.get("handoff"):
+        return "handoff_node"
     return "agent_node"
 
 
