@@ -110,6 +110,8 @@ class CalendarClient:
     def _format_time(self, iso: str) -> str:
         try:
             dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+            # Convert to studio local time so callers hear the correct hour
+            dt = dt.astimezone(self._tz)
             return dt.strftime("%-I:%M %p on %a %b %-d")
         except Exception:
             return iso

@@ -82,13 +82,13 @@ async def tools_node(state: AgentState, config: RunnableConfig) -> dict:
     tool_calls = getattr(last_ai, "tool_calls", [])
     tool_names = [tc["name"] for tc in tool_calls]
 
-    log.info("── tools_node ── executing: %s", tool_names)
+    log.info(
+        "TOOL CALL | %s  args=%s",
+        tool_names,
+        {tc["name"]: tc.get("args", {}) for tc in tool_calls},
+    )
     for tc in tool_calls:
-        log.info(
-            "  tool call | name=%s  args=%s",
-            tc["name"],
-            tc.get("args", {}),
-        )
+        pass  # args already logged above
 
     t_tools = time.perf_counter()
     result = await _raw_tools_node.ainvoke(state, config=config)
@@ -97,12 +97,12 @@ async def tools_node(state: AgentState, config: RunnableConfig) -> dict:
     for msg in result.get("messages", []):
         if isinstance(msg, ToolMessage):
             log.info(
-                "  tool result | name=%s  content=%r",
+                "TOOL RESULT | %s → %r",
                 msg.name,
-                str(msg.content)[:300],
+                str(msg.content)[:400],
             )
 
-    log.info("── tools_node ── finished: %s  %.1fms", tool_names, tools_ms)
+    log.info("TOOL DONE | %s  %.0fms", tool_names, tools_ms)
 
     caller_name = state.get("caller_name") or ""
     caller_phone = state.get("caller_phone") or ""
@@ -113,32 +113,59 @@ async def tools_node(state: AgentState, config: RunnableConfig) -> dict:
                 name = args.get("caller_name", "")
                 if name:
                     caller_name = name
-                    log.info(
-                        "tools_node: captured caller_name=%r from tool %s",
-                        name,
-                        tc["name"],
-                    )
             if not caller_phone:
                 phone = args.get("caller_phone", "")
                 if phone:
                     caller_phone = phone
-                    log.info(
-                        "tools_node: captured caller_phone=%r from tool %s",
-                        phone,
-                        tc["name"],
-                    )
 
     if caller_name and caller_name != state.get("caller_name"):
-        log.info("tools_node: updating state caller_name=%r", caller_name)
         result["caller_name"] = caller_name
     if caller_phone and caller_phone != state.get("caller_phone"):
-        log.info("tools_node: updating state caller_phone=%r", caller_phone)
         result["caller_phone"] = caller_phone
 
-    # Track escalation in state so downstream nodes and logs can see it
+    # Track escalation in state — but ONLY for legitimate reasons.
+    # Booking / general requests must never trigger a transfer.
+    _VALID_ESCALATION_KEYWORDS = frozenset(
+        {
+            "billing",
+            "charge",
+            "dispute",
+            "refund",
+            "aggressive",
+            "abusive",
+            "abuse",
+            "complaint",
+            "rude",
+        }
+    )
     if "escalate_to_human" in tool_names:
-        log.info("tools_node: escalation detected — marking handoff=True")
-        result["handoff"] = True
+        escalation_reason = ""
+        for tc in last_ai.tool_calls:
+            if tc["name"] == "escalate_to_human":
+                escalation_reason = tc.get("args", {}).get("reason", "").lower()
+
+        is_valid_escalation = any(
+            kw in escalation_reason for kw in _VALID_ESCALATION_KEYWORDS
+        )
+
+        if is_valid_escalation:
+            log.info("ESCALATE | valid reason=%r", escalation_reason)
+            result["handoff"] = True
+        else:
+            log.warning("ESCALATE BLOCKED | reason=%r", escalation_reason)
+            # Override the ToolMessage so the LLM understands it must NOT transfer
+            for msg in result.get("messages", []):
+                if isinstance(msg, ToolMessage) and msg.name == "escalate_to_human":
+                    msg.content = (
+                        "BLOCKED: escalation is not permitted for this request. "
+                        "This is a routine booking or information request — you must "
+                        "handle it yourself. "
+                        "Step 1: call list_upcoming_classes with the requested date. "
+                        "Step 2: present the options and ask which class the caller wants. "
+                        "Step 3: collect the caller's name if not already known. "
+                        "Step 4: call book_class to complete the booking. "
+                        "Do NOT attempt to escalate again for this request."
+                    )
 
     return result
 
@@ -146,12 +173,6 @@ async def tools_node(state: AgentState, config: RunnableConfig) -> dict:
 def agent_node(state: AgentState) -> dict:
     caller_phone = state.get("caller_phone") or ""
     caller_name = state.get("caller_name") or ""
-    log.info(
-        "── agent_node ── messages=%d  caller=%s  phone=%s",
-        len(state["messages"]),
-        caller_name or "(unknown)",
-        caller_phone or "(none)",
-    )
     messages = state["messages"]
 
     building_system = not messages or not isinstance(messages[0], SystemMessage)
@@ -165,14 +186,8 @@ def agent_node(state: AgentState) -> dict:
             if caller_name:
                 system_content += f"- Name: {caller_name}\n"
         messages = [SystemMessage(content=system_content)] + list(messages)
-        log.info(
-            "agent_node: system prompt built | phone_injected=%s  name_injected=%s  prompt_tail=%r",
-            bool(caller_phone),
-            bool(caller_name),
-            system_content[-200:].replace("\n", " "),
-        )
 
-    log.info("agent_node: sending %d messages to LLM", len(messages))
+    log.debug("LLM sending %d messages", len(messages))
     t_llm = time.perf_counter()
     try:
         ai_message = _model_with_tools.invoke(messages)
@@ -192,12 +207,10 @@ def agent_node(state: AgentState) -> dict:
         llm_ms = (time.perf_counter() - t_llm) * 1000
         if hasattr(ai_message, "tool_calls") and ai_message.tool_calls:
             names = [tc["name"] for tc in ai_message.tool_calls]
-            log.info("agent_node: LLM → tools %s  %.1fms", names, llm_ms)
-            for tc in ai_message.tool_calls:
-                log.info("  planned call | %s  args=%s", tc["name"], tc.get("args", {}))
+            log.info("LLM → TOOLS | %s  %.0fms", names, llm_ms)
         else:
-            preview = str(ai_message.content)[:120].replace("\n", " ")
-            log.info("agent_node: LLM → text reply  %.1fms  %r", llm_ms, preview)
+            preview = str(ai_message.content)[:200].replace("\n", " ")
+            log.info("LLM → REPLY | %.0fms  %r", llm_ms, preview)
 
     return {"messages": [ai_message]}
 
@@ -242,19 +255,14 @@ def finalize_node(state: AgentState) -> dict:
             for tc in msg.tool_calls:
                 tool_names_used.add(tc["name"])
 
-    log.info("finalize_node: all tools used this session: %s", sorted(tool_names_used))
+    log.info("FINALIZE | session tools=%s", sorted(tool_names_used))
 
     if not (tool_names_used & _MEANINGFUL_TOOLS):
-        log.info("finalize_node: no meaningful tools used, skipping sheet write")
+        log.debug("FINALIZE | no meaningful tools, skipping sheet write")
         return {"call_summary": ""}
 
     caller_name = state.get("caller_name") or ""
     caller_phone = state.get("caller_phone") or ""
-    log.info(
-        "finalize_node: state has caller_name=%r  caller_phone=%r",
-        caller_name,
-        caller_phone,
-    )
     if not caller_name or not caller_phone:
         for msg in state["messages"]:
             if isinstance(msg, AIMessage) and msg.tool_calls:

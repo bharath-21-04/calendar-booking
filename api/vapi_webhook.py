@@ -8,10 +8,33 @@ from typing import Any
 from uuid import uuid4
 
 from fastapi import APIRouter, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from agent.graph import graph
 from agent.state import AgentState
+from agent.tools import (
+    list_upcoming_classes,
+    check_class_availability,
+    book_class,
+    reschedule_booking,
+    cancel_booking,
+    get_studio_info,
+    log_caller_note,
+    escalate_to_human,
+)
+from config.settings import get_settings
+
+# Registry of tools callable by VAPI's native LLM via server-URL tool calls.
+_TOOL_REGISTRY: dict[str, Any] = {
+    "list_upcoming_classes": list_upcoming_classes,
+    "check_class_availability": check_class_availability,
+    "book_class": book_class,
+    "reschedule_booking": reschedule_booking,
+    "cancel_booking": cancel_booking,
+    "get_studio_info": get_studio_info,
+    "log_caller_note": log_caller_note,
+    "escalate_to_human": escalate_to_human,
+}
 
 router = APIRouter()
 log = logging.getLogger(__name__)
@@ -23,6 +46,7 @@ _last_turn: dict[str, tuple[str, str]] = {}
 
 
 # ── helpers ────────────────────────────────────────────────────────────────────
+
 
 def _extract_reply(result: dict[str, Any]) -> str:
     """Pull the text content out of the last message in the graph result."""
@@ -40,7 +64,7 @@ def _extract_reply(result: dict[str, Any]) -> str:
 def _openai_completion(text: str) -> dict:
     """
     Return a VAPI-compatible OpenAI chat-completion response (non-streaming).
-    VAPI reads the text from choices[0].delta.content or choices[0].message.content.
+    VAPI reads the text from choices[0].message.content.
     """
     return {
         "id": f"chatcmpl-{uuid4().hex[:24]}",
@@ -48,7 +72,6 @@ def _openai_completion(text: str) -> dict:
         "choices": [
             {
                 "index": 0,
-                "delta": {"content": text},
                 "message": {"role": "assistant", "content": text},
                 "finish_reason": "stop",
             }
@@ -56,16 +79,97 @@ def _openai_completion(text: str) -> dict:
     }
 
 
+def _openai_sse_stream(text: str):
+    """
+    Yield SSE chunks for a VAPI Custom LLM streaming response.
+    VAPI always requests stream=true; we send the full text in one chunk
+    then a stop chunk, followed by [DONE].
+    """
+    cid = f"chatcmpl-{uuid4().hex[:24]}"
+    # Single content chunk
+    chunk = json.dumps(
+        {
+            "id": cid,
+            "object": "chat.completion.chunk",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"role": "assistant", "content": text},
+                    "finish_reason": None,
+                }
+            ],
+        }
+    )
+    yield f"data: {chunk}\n\n"
+    # Stop chunk
+    stop = json.dumps(
+        {
+            "id": cid,
+            "object": "chat.completion.chunk",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+        }
+    )
+    yield f"data: {stop}\n\n"
+    yield "data: [DONE]\n\n"
+
+
+def _vapi_transfer_call(handoff_text: str, destination: str) -> dict:
+    """
+    Return a VAPI-compatible response that triggers a real phone transfer.
+
+    VAPI intercepts the 'transferCall' tool call in the Custom LLM response
+    and initiates the actual PSTN/SIP transfer to `destination`.
+    The `content` field is spoken to the caller just before the transfer.
+    """
+    call_id = f"call_{uuid4().hex[:24]}"
+    return {
+        "id": f"chatcmpl-{uuid4().hex[:24]}",
+        "object": "chat.completion",
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": handoff_text,
+                    "tool_calls": [
+                        {
+                            "id": call_id,
+                            "type": "function",
+                            "function": {
+                                "name": "transferCall",
+                                "arguments": json.dumps({"destination": destination}),
+                            },
+                        }
+                    ],
+                },
+                "finish_reason": "tool_calls",
+            }
+        ],
+    }
+
+
 # ── main endpoint ──────────────────────────────────────────────────────────────
 
+
+@router.post("/vapi/webhook/chat/completions", tags=["Vapi"])
 @router.post("/vapi/webhook", tags=["Vapi"])
 async def vapi_webhook(request: Request) -> JSONResponse:
     t_start = time.perf_counter()
     payload = await request.json()
 
-    # Always log the full payload — critical for debugging
-    log.info("VAPI raw payload:\n%s", json.dumps(payload, indent=2))
-    log.info("VAPI top-level keys: %s", list(payload.keys()))
+    # ── diagnose payload shape ─────────────────────────────────────────────────
+    has_messages_list = isinstance(payload.get("messages"), list)
+    has_message_dict = isinstance(payload.get("message"), dict)
+    msg_type = (
+        (payload.get("message") or {}).get("type", "") if has_message_dict else ""
+    )
+    log.info(
+        "WEBHOOK | keys=%s  has_messages=%s  has_message=%s  msg_type=%r",
+        list(payload.keys()),
+        has_messages_list,
+        has_message_dict,
+        msg_type,
+    )
 
     # ── Route by payload shape ─────────────────────────────────────────────────
     #
@@ -77,17 +181,24 @@ async def vapi_webhook(request: Request) -> JSONResponse:
     #   VAPI sends these for call lifecycle (status-update, end-of-call-report,
     #   assistant-request, etc.).  No agent processing needed.
 
-    if isinstance(payload.get("messages"), list):
+    if has_messages_list:
+        log.info("WEBHOOK → Custom LLM handler  messages=%d", len(payload["messages"]))
         return await _handle_custom_llm(payload, t_start)
 
-    if isinstance(payload.get("message"), dict):
-        return _handle_lifecycle(payload["message"])
+    if has_message_dict:
+        msg = payload["message"]
+        if msg.get("type") == "tool-calls":
+            log.info("WEBHOOK → tool-calls handler")
+            return await _handle_tool_calls(msg)
+        log.info("WEBHOOK → lifecycle handler  type=%r", msg_type)
+        return _handle_lifecycle(msg)
 
     log.warning("VAPI unrecognised payload structure — keys=%s", list(payload.keys()))
     return JSONResponse(content={})
 
 
 # ── lifecycle events (informational, no agent involvement) ─────────────────────
+
 
 def _handle_lifecycle(message: dict) -> JSONResponse:
     """
@@ -107,7 +218,9 @@ def _handle_lifecycle(message: dict) -> JSONResponse:
             _last_turn.pop(call_id, None)
             log.info(
                 "VAPI state cleanup | call=%s  active_locks=%d  cached_turns=%d",
-                call_id, len(_call_locks), len(_last_turn),
+                call_id,
+                len(_call_locks),
+                len(_last_turn),
             )
 
     # assistant-request: VAPI asks which assistant to use for a new call.
@@ -117,7 +230,80 @@ def _handle_lifecycle(message: dict) -> JSONResponse:
     return JSONResponse(content={})
 
 
+# ── VAPI native-LLM tool-call handler ─────────────────────────────────────────
+
+
+async def _handle_tool_calls(message: dict) -> JSONResponse:
+    """
+    Handle tool-calls sent by VAPI's native LLM (GPT-4.1 etc.) via server URL.
+
+    VAPI sends:
+      {"type": "tool-calls", "toolCallList": [{"id": "...", "function": {"name": ..., "arguments": "..."}}], "call": {...}}
+
+    We execute each tool using the same implementations as the LangGraph agent
+    and return:
+      {"results": [{"toolCallId": "...", "result": "..."}]}
+    """
+    tool_call_list: list[dict] = message.get("toolCallList", [])
+    call: dict = message.get("call", {})
+    caller_phone: str = (
+        call.get("customer", {}).get("number", "")
+        or call.get("phoneNumber", {}).get("number", "")
+        or ""
+    )
+
+    log.info(
+        "VAPI tool-calls | count=%d  caller_phone=%s  tools=%s",
+        len(tool_call_list),
+        caller_phone or "(none)",
+        [tc.get("function", {}).get("name") for tc in tool_call_list],
+    )
+
+    results: list[dict] = []
+    for tc in tool_call_list:
+        tool_id: str = tc.get("id", "")
+        fn: dict = tc.get("function", {})
+        tool_name: str = fn.get("name", "")
+
+        try:
+            args: dict = json.loads(fn.get("arguments", "{}"))
+        except (json.JSONDecodeError, ValueError):
+            args = {}
+
+        log.info("  executing | name=%s  args=%s", tool_name, args)
+
+        # Inject caller_phone from call metadata when the LLM omitted it.
+        # These tools all accept caller_phone; inject it from VAPI metadata.
+        _PHONE_TOOLS = {
+            "book_class",
+            "reschedule_booking",
+            "cancel_booking",
+            "log_caller_note",
+            "escalate_to_human",
+        }
+        if tool_name in _PHONE_TOOLS and not args.get("caller_phone") and caller_phone:
+            args["caller_phone"] = caller_phone
+            log.info("  injected caller_phone=%s into %s", caller_phone, tool_name)
+
+        tool_fn = _TOOL_REGISTRY.get(tool_name)
+        if tool_fn is None:
+            result = f"ERROR: unknown tool '{tool_name}'"
+            log.warning("  unknown tool: %s", tool_name)
+        else:
+            try:
+                result = tool_fn.invoke(args)
+                log.info("  result | %s → %r", tool_name, str(result)[:200])
+            except Exception as exc:
+                result = f"ERROR: {tool_name} failed — {exc}"
+                log.error("  tool error | %s: %s", tool_name, exc, exc_info=True)
+
+        results.append({"toolCallId": tool_id, "result": str(result)})
+
+    return JSONResponse(content={"results": results})
+
+
 # ── Custom LLM per-turn handler ────────────────────────────────────────────────
+
 
 async def _handle_custom_llm(payload: dict, t_start: float) -> JSONResponse:
     """
@@ -130,26 +316,16 @@ async def _handle_custom_llm(payload: dict, t_start: float) -> JSONResponse:
     messages: list[dict] = payload["messages"]
     call: dict = payload.get("call", {})
     session_id: str = call.get("id") or str(uuid4())
-    caller_phone: str = (
-        call.get("customer", {}).get("number", "")
-        or payload.get("customer", {}).get("number", "")
-    )
+    caller_phone: str = call.get("customer", {}).get("number", "") or payload.get(
+        "customer", {}
+    ).get("number", "")
 
     log.info(
-        "VAPI custom LLM | session=%s  phone=%s  messages=%d",
-        session_id, caller_phone or "(none)", len(messages),
+        "VAPI custom LLM | session=%s  phone=%s  turn=%d",
+        session_id,
+        caller_phone or "(none)",
+        len([m for m in messages if m.get("role") == "user"]),
     )
-
-    # Log every message for full visibility
-    for i, m in enumerate(messages):
-        content = m.get("content", "")
-        if isinstance(content, str):
-            preview = content[:150]
-        else:
-            preview = " | ".join(
-                p.get("text", "")[:60] for p in content if isinstance(p, dict)
-            )
-        log.info("  messages[%d] role=%-12s  %r", i, m.get("role", "?"), preview)
 
     # Extract the most recent user message as the current transcript
     transcript = ""
@@ -174,7 +350,7 @@ async def _handle_custom_llm(payload: dict, t_start: float) -> JSONResponse:
             content=_openai_completion("I didn't catch that, could you please repeat?")
         )
 
-    log.info("VAPI user turn | session=%s  transcript=%r", session_id, transcript)
+    log.info("USER  | session=%s  %r", session_id, transcript)
 
     # ── dedup + per-call serialisation lock ────────────────────────────────────
     if session_id not in _call_locks:
@@ -183,7 +359,7 @@ async def _handle_custom_llm(payload: dict, t_start: float) -> JSONResponse:
     async with _call_locks[session_id]:
         cached = _last_turn.get(session_id)
         if cached and cached[0] == transcript:
-            log.info("VAPI dedup hit | session=%s", session_id)
+            log.info("DEDUP | session=%s  returning cached reply", session_id)
             return JSONResponse(content=_openai_completion(cached[1]))
 
         # ── build LangGraph input ──────────────────────────────────────────────
@@ -192,9 +368,7 @@ async def _handle_custom_llm(payload: dict, t_start: float) -> JSONResponse:
         is_first_turn = not existing.values
 
         if is_first_turn:
-            log.info(
-                "VAPI first turn | session=%s  phone=%s", session_id, caller_phone
-            )
+            log.info("CALL START | session=%s  phone=%s", session_id, caller_phone)
             input_state: AgentState = {
                 "messages": [{"role": "user", "content": transcript}],
                 "caller_phone": caller_phone,
@@ -223,21 +397,39 @@ async def _handle_custom_llm(payload: dict, t_start: float) -> JSONResponse:
         result = await graph.ainvoke(input_state, config=config)
         graph_ms = (time.perf_counter() - t_graph) * 1000
 
+        reply = _extract_reply(result)
+        _last_turn[session_id] = (transcript, reply)
+
         log.info(
-            "VAPI graph done | session=%s  messages=%d  caller_name=%r  handoff=%s  %.1fms",
+            "AGENT | session=%s  caller_name=%r  handoff=%s  %.0fms",
             session_id,
-            len(result.get("messages", [])),
-            result.get("caller_name") or "",
+            result.get("caller_name") or "(none)",
             result.get("handoff", False),
             graph_ms,
         )
 
-        reply = _extract_reply(result)
-        _last_turn[session_id] = (transcript, reply)
-
     total_ms = (time.perf_counter() - t_start) * 1000
+
+    # ── Transfer the call if the agent escalated ───────────────────────────────
+    if result.get("handoff"):
+        transfer_number = get_settings().studio_transfer_number
+        if transfer_number:
+            log.info("TRANSFER | session=%s  → %s", session_id, transfer_number)
+            return JSONResponse(content=_vapi_transfer_call(reply, transfer_number))
+        else:
+            log.warning(
+                "TRANSFER requested but STUDIO_TRANSFER_NUMBER not set | session=%s",
+                session_id,
+            )
+
     log.info(
-        "VAPI response | session=%s  reply=%r  total=%.1fms",
-        session_id, reply[:200], total_ms,
+        "REPLY → VAPI | session=%s  stream=%s  content=%r",
+        session_id,
+        payload.get("stream"),
+        reply[:400],
     )
+    if payload.get("stream"):
+        return StreamingResponse(
+            _openai_sse_stream(reply), media_type="text/event-stream"
+        )
     return JSONResponse(content=_openai_completion(reply))

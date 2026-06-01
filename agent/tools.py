@@ -41,6 +41,42 @@ def _validate_phone(phone: str) -> str | None:
     return None
 
 
+_PLACEHOLDER_NAMES = frozenset(
+    {
+        "unknown",
+        "unknown caller",
+        "unknown user",
+        "n/a",
+        "na",
+        "none",
+        "caller",
+        "user",
+        "customer",
+        "client",
+        "person",
+        "someone",
+        "name",
+        "full name",
+        "your name",
+    }
+)
+
+
+def _validate_name(name: str) -> str | None:
+    """Return None if name looks real, or an error string if it's a placeholder."""
+    if not name or not name.strip():
+        return (
+            "ERROR: caller_name is empty. "
+            "Ask the caller for their full name before calling this tool."
+        )
+    if name.strip().lower() in _PLACEHOLDER_NAMES:
+        return (
+            f"ERROR: '{name}' is not a real name. "
+            "Ask the caller for their full name, then try again."
+        )
+    return None
+
+
 def _normalize_date(date: str) -> str:
     original = date
     date = date.strip().lower()
@@ -175,6 +211,9 @@ def book_class(class_id: str, caller_name: str, caller_phone: str) -> str:
     )
     if not caller_name or not caller_phone:
         return "ERROR: caller name and phone number are required before booking. Ask the caller for both, then try again."
+    name_err = _validate_name(caller_name)
+    if name_err:
+        return name_err
     phone_err = _validate_phone(caller_phone)
     if phone_err:
         return phone_err
@@ -217,6 +256,9 @@ def reschedule_booking(
     )
     if not caller_name or not caller_phone:
         return "ERROR: caller name and phone number are required before rescheduling. Ask the caller for both, then try again."
+    name_err = _validate_name(caller_name)
+    if name_err:
+        return name_err
     phone_err = _validate_phone(caller_phone)
     if phone_err:
         return phone_err
@@ -260,6 +302,9 @@ def cancel_booking(class_id: str, caller_name: str, caller_phone: str) -> str:
     )
     if not caller_name or not caller_phone:
         return "ERROR: caller name and phone number are required before cancelling. Ask the caller for both, then try again."
+    name_err = _validate_name(caller_name)
+    if name_err:
+        return name_err
     phone_err = _validate_phone(caller_phone)
     if phone_err:
         return phone_err
@@ -335,10 +380,16 @@ def log_caller_note(
 
 @tool
 def escalate_to_human(reason: str, caller_name: str, caller_phone: str) -> str:
-    """Escalate this call by saving details to the CRM so the studio can follow up.
+    """Save caller details to the CRM and trigger an immediate live phone transfer.
 
-    DO NOT hang up or transfer the call. After calling this tool, tell the caller
-    the studio will call them back and continue the conversation normally.
+    ONLY call this tool for:
+    - Billing complaints or charge disputes
+    - Refund requests
+    - Aggressive or abusive callers
+
+    NEVER call this tool for bookings, cancellations, rescheduling, class
+    inquiries, pricing questions, or general studio information — handle
+    those yourself using the available tools.
 
     IMPORTANT: Before calling this tool you MUST have the caller's name and
     phone number. If you do not have them, ask for them first.
@@ -376,9 +427,8 @@ def escalate_to_human(reason: str, caller_name: str, caller_phone: str) -> str:
     name_part = f" {caller_name.split()[0]}" if caller_name else ""
     return (
         f"Saved.{name_part}'s details ({caller_phone}) and reason ({reason!r}) are "
-        "logged. Tell the caller: a Solstice Pilates team member will call them back "
-        "shortly. Do NOT say goodbye or hang up — keep the call active and ask if "
-        "there is anything else you can help with."
+        "logged. Now say exactly: 'Let me transfer you to our team now — please hold.' "
+        "The call will be transferred immediately after you say that."
     )
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from integrations.calendar import CalendarClient
 from config.settings import get_settings
@@ -34,13 +35,22 @@ def seed() -> None:
     client = CalendarClient()
     settings = get_settings()
     today = date.today()
+    tz = ZoneInfo(settings.studio_timezone)
 
     for (hour, minute, cls_type, capacity, pre_booked), day_offset in zip(
         SEED_SCHEDULE, DAY_OFFSETS
     ):
         event_date = today + timedelta(days=day_offset)
+        # Use timezone-aware datetimes so the IST offset is embedded in the
+        # ISO string sent to Google Calendar — prevents the 12.5-hour shift
+        # that occurs when naive datetimes are serialised on non-IST machines.
         start_dt = datetime(
-            event_date.year, event_date.month, event_date.day, hour, minute
+            event_date.year,
+            event_date.month,
+            event_date.day,
+            hour,
+            minute,
+            tzinfo=tz,
         )
         end_dt = start_dt + timedelta(hours=1)
 

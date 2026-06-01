@@ -22,6 +22,7 @@ class Settings(BaseSettings):
     google_calendar_id: str = Field(..., env="GOOGLE_CALENDAR_ID")
     google_sheet_id: str = Field(..., env="GOOGLE_SHEET_ID")
     vapi_webhook_secret: str = Field(..., env="VAPI_WEBHOOK_SECRET")
+    studio_transfer_number: str = Field("", env="STUDIO_TRANSFER_NUMBER")
     class_capacity_default: int = Field(10, env="CLASS_CAPACITY_DEFAULT")
     studio_timezone: str = Field("Asia/Kolkata", env="STUDIO_TIMEZONE")
 
