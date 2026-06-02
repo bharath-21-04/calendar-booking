@@ -125,17 +125,19 @@ async def tools_node(state: AgentState, config: RunnableConfig) -> dict:
 
     # Track escalation in state — but ONLY for legitimate reasons.
     # Booking / general requests must never trigger a transfer.
+    # "refund" alone is too broad — a refund for a canceled session is
+    # handled by cancel_booking, not a human transfer.
     _VALID_ESCALATION_KEYWORDS = frozenset(
         {
-            "billing",
-            "charge",
+            "billing dispute",
+            "charge dispute",
             "dispute",
-            "refund",
             "aggressive",
             "abusive",
             "abuse",
             "complaint",
             "rude",
+            "threatening",
         }
     )
     if "escalate_to_human" in tool_names:

@@ -41,6 +41,46 @@ def _validate_phone(phone: str) -> str | None:
     return None
 
 
+_SPOKEN_DIGIT = {
+    "zero": "0",
+    "one": "1",
+    "two": "2",
+    "three": "3",
+    "four": "4",
+    "five": "5",
+    "six": "6",
+    "seven": "7",
+    "eight": "8",
+    "nine": "9",
+    "oh": "0",
+}
+
+
+def _normalize_phone(phone: str) -> str:
+    """
+    Convert a spoken phone number ("six three eight...") to digits ("638...").
+    Also strips spaces, dashes, parentheses — keeps only digits and a leading +.
+    """
+    if not phone:
+        return phone
+    # Replace each spoken word with its digit if it matches
+    tokens = re.split(r"[\s,]+", phone.lower())
+    parts = []
+    any_word_matched = False
+    for tok in tokens:
+        tok_clean = re.sub(r"[^\w]", "", tok)
+        if tok_clean in _SPOKEN_DIGIT:
+            parts.append(_SPOKEN_DIGIT[tok_clean])
+            any_word_matched = True
+        else:
+            parts.append(tok_clean)
+    if any_word_matched:
+        phone = "".join(parts)
+    # Strip everything except digits and leading +
+    phone = re.sub(r"(?!^\+)[^\d]", "", phone)
+    return phone
+
+
 _PLACEHOLDER_NAMES = frozenset(
     {
         "unknown",
@@ -211,6 +251,7 @@ def book_class(class_id: str, caller_name: str, caller_phone: str) -> str:
     )
     if not caller_name or not caller_phone:
         return "ERROR: caller name and phone number are required before booking. Ask the caller for both, then try again."
+    caller_phone = _normalize_phone(caller_phone)
     name_err = _validate_name(caller_name)
     if name_err:
         return name_err
@@ -256,6 +297,7 @@ def reschedule_booking(
     )
     if not caller_name or not caller_phone:
         return "ERROR: caller name and phone number are required before rescheduling. Ask the caller for both, then try again."
+    caller_phone = _normalize_phone(caller_phone)
     name_err = _validate_name(caller_name)
     if name_err:
         return name_err
@@ -302,6 +344,7 @@ def cancel_booking(class_id: str, caller_name: str, caller_phone: str) -> str:
     )
     if not caller_name or not caller_phone:
         return "ERROR: caller name and phone number are required before cancelling. Ask the caller for both, then try again."
+    caller_phone = _normalize_phone(caller_phone)
     name_err = _validate_name(caller_name)
     if name_err:
         return name_err
@@ -369,6 +412,7 @@ def log_caller_note(
         caller_name,
         topic,
     )
+    caller_phone = _normalize_phone(caller_phone)
     try:
         _sheets.upsert_caller(caller_phone, caller_name, topic, notes)
         log.info("TOOL log_caller_note | saved to sheets")
@@ -408,6 +452,7 @@ def escalate_to_human(reason: str, caller_name: str, caller_phone: str) -> str:
         caller_phone,
         reason,
     )
+    caller_phone = _normalize_phone(caller_phone or "")
     try:
         _sheets.upsert_caller(
             phone=caller_phone or "unknown",
