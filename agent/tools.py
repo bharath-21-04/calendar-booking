@@ -13,57 +13,26 @@ _calendar = CalendarClient()
 _sheets = SheetsClient()
 
 _WEEKDAYS = {
-    "monday": 0,
-    "tuesday": 1,
-    "wednesday": 2,
-    "thursday": 3,
-    "friday": 4,
-    "saturday": 5,
-    "sunday": 6,
-    "mon": 0,
-    "tue": 1,
-    "wed": 2,
-    "thu": 3,
-    "fri": 4,
-    "sat": 5,
-    "sun": 6,
+    "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
+    "friday": 4, "saturday": 5, "sunday": 6,
+    "mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6,
 }
-
-
-def _validate_phone(phone: str) -> str | None:
-    """Return None if phone looks valid, or an error string if it's clearly invented."""
-    digits = re.sub(r"\D", "", phone)
-    if len(digits) < 10:
-        return (
-            "ERROR: the phone number looks incomplete. "
-            "Ask the caller for their full phone number, then try again."
-        )
-    return None
-
 
 _SPOKEN_DIGIT = {
-    "zero": "0",
-    "one": "1",
-    "two": "2",
-    "three": "3",
-    "four": "4",
-    "five": "5",
-    "six": "6",
-    "seven": "7",
-    "eight": "8",
-    "nine": "9",
-    "oh": "0",
+    "zero": "0", "one": "1", "two": "2", "three": "3", "four": "4",
+    "five": "5", "six": "6", "seven": "7", "eight": "8", "nine": "9", "oh": "0",
 }
+
+_PLACEHOLDER_NAMES = frozenset({
+    "unknown", "unknown caller", "unknown user", "n/a", "na", "none",
+    "caller", "user", "customer", "client", "person", "someone",
+    "name", "full name", "your name",
+})
 
 
 def _normalize_phone(phone: str) -> str:
-    """
-    Convert a spoken phone number ("six three eight...") to digits ("638...").
-    Also strips spaces, dashes, parentheses — keeps only digits and a leading +.
-    """
     if not phone:
         return phone
-    # Replace each spoken word with its digit if it matches
     tokens = re.split(r"[\s,]+", phone.lower())
     parts = []
     any_word_matched = False
@@ -76,44 +45,20 @@ def _normalize_phone(phone: str) -> str:
             parts.append(tok_clean)
     if any_word_matched:
         phone = "".join(parts)
-    # Strip everything except digits and leading +
-    phone = re.sub(r"(?!^\+)[^\d]", "", phone)
-    return phone
+    return re.sub(r"(?!^\+)[^\d]", "", phone)
 
 
-_PLACEHOLDER_NAMES = frozenset(
-    {
-        "unknown",
-        "unknown caller",
-        "unknown user",
-        "n/a",
-        "na",
-        "none",
-        "caller",
-        "user",
-        "customer",
-        "client",
-        "person",
-        "someone",
-        "name",
-        "full name",
-        "your name",
-    }
-)
+def _validate_phone(phone: str) -> str | None:
+    if len(re.sub(r"\D", "", phone)) < 10:
+        return "ERROR: the phone number looks incomplete. Ask the caller for their full phone number, then try again."
+    return None
 
 
 def _validate_name(name: str) -> str | None:
-    """Return None if name looks real, or an error string if it's a placeholder."""
     if not name or not name.strip():
-        return (
-            "ERROR: caller_name is empty. "
-            "Ask the caller for their full name before calling this tool."
-        )
+        return "ERROR: caller_name is empty. Ask the caller for their full name before calling this tool."
     if name.strip().lower() in _PLACEHOLDER_NAMES:
-        return (
-            f"ERROR: '{name}' is not a real name. "
-            "Ask the caller for their full name, then try again."
-        )
+        return f"ERROR: '{name}' is not a real name. Ask the caller for their full name, then try again."
     return None
 
 
@@ -130,14 +75,12 @@ def _normalize_date(date: str) -> str:
 
     for prefix in ("next ", "this ", ""):
         if date.startswith(prefix):
-            day_word = date[len(prefix) :].strip()
+            day_word = date[len(prefix):].strip()
             if day_word in _WEEKDAYS:
                 target_dow = _WEEKDAYS[day_word]
                 days_ahead = (target_dow - now.weekday()) % 7
                 if prefix == "next " and days_ahead == 0:
                     days_ahead = 7
-                if days_ahead == 0 and prefix != "next ":
-                    days_ahead = 0
                 return (now + timedelta(days=days_ahead)).strftime("%Y-%m-%d")
 
     date = original.strip()
@@ -170,23 +113,17 @@ def list_upcoming_classes(date: str) -> str:
     """List all classes and their availability for a given date.
 
     Args:
-        date: When to look. Accepts ISO dates, month+day, weekday names,
-              or relative words. Examples:
-                "today", "tomorrow",
-                "Monday", "this Friday", "next Saturday",
-                "June 1", "06-01", "2026-06-01".
-              The current year is assumed when no year is given.
+        date: When to look. Accepts ISO dates (2026-06-01), month+day (June 1),
+              weekday names (Monday, this Friday, next Saturday), or relative words
+              (today, tomorrow). Current year assumed when no year is given.
 
     Returns:
         Human-readable summary of classes and open spots.
-        Example: "We have a Reformer at 6 AM with 4 spots, Mat at 9 AM with 8 spots."
     """
     log.info("TOOL list_upcoming_classes | raw_date=%r", date)
     try:
         date = _normalize_date(date)
-        log.info("TOOL list_upcoming_classes | normalized=%r", date)
         slots = _calendar.list_classes(date)
-        log.info("TOOL list_upcoming_classes | found %d slots", len(slots))
         if not slots:
             return "There are no classes scheduled for that day."
         parts = []
@@ -195,9 +132,7 @@ def list_upcoming_classes(date: str) -> str:
                 parts.append(f"{s.title} at {s.time} (id:{s.class_id}) is fully booked")
             else:
                 label = "spot" if s.spots_left == 1 else "spots"
-                parts.append(
-                    f"{s.title} at {s.time} (id:{s.class_id}) has {s.spots_left} {label} left"
-                )
+                parts.append(f"{s.title} at {s.time} (id:{s.class_id}) has {s.spots_left} {label} left")
         return "Here's what we have: " + ", ".join(parts) + "."
     except Exception as exc:
         log.error("list_upcoming_classes failed: %s", exc, exc_info=True)
@@ -213,20 +148,15 @@ def check_class_availability(class_id: str) -> str:
 
     Returns:
         Human-readable availability string.
-        Example: "That class has 3 spots left." or "That class is fully booked."
     """
-    log.info("TOOL check_class_availability | class_id=%r", class_id)
     try:
         spots = _calendar.check_availability(class_id)
-        log.info("TOOL check_class_availability | spots_left=%d", spots)
         if spots == 0:
             return "That class is fully booked."
         label = "spot" if spots == 1 else "spots"
         return f"That class has {spots} {label} left."
     except Exception as exc:
-        log.error(
-            "check_class_availability failed for %s: %s", class_id, exc, exc_info=True
-        )
+        log.error("check_class_availability failed for %s: %s", class_id, exc, exc_info=True)
         return f"ERROR: could not check availability — {exc}"
 
 
@@ -241,29 +171,17 @@ def book_class(class_id: str, caller_name: str, caller_phone: str) -> str:
 
     Returns:
         Confirmation string on success, or an error string if fully booked.
-        Example: "You're all set for Reformer at 6 PM on Monday June 1."
     """
-    log.info(
-        "TOOL book_class | class_id=%r  name=%r  phone=%r",
-        class_id,
-        caller_name,
-        caller_phone,
-    )
     if not caller_name or not caller_phone:
         return "ERROR: caller name and phone number are required before booking. Ask the caller for both, then try again."
     caller_phone = _normalize_phone(caller_phone)
-    name_err = _validate_name(caller_name)
-    if name_err:
-        return name_err
-    phone_err = _validate_phone(caller_phone)
-    if phone_err:
-        return phone_err
+    if err := _validate_name(caller_name):
+        return err
+    if err := _validate_phone(caller_phone):
+        return err
     try:
-        confirmation = _calendar.book_class(class_id, caller_name, caller_phone)
-        log.info("TOOL book_class | success: %r", confirmation)
-        return confirmation
+        return _calendar.book_class(class_id, caller_name, caller_phone)
     except ValueError as exc:
-        log.warning("TOOL book_class | ValueError: %s", exc)
         return str(exc)
     except Exception as exc:
         log.error("book_class failed for event %s: %s", class_id, exc, exc_info=True)
@@ -271,12 +189,7 @@ def book_class(class_id: str, caller_name: str, caller_phone: str) -> str:
 
 
 @tool
-def reschedule_booking(
-    old_class_id: str,
-    new_class_id: str,
-    caller_name: str,
-    caller_phone: str,
-) -> str:
+def reschedule_booking(old_class_id: str, new_class_id: str, caller_name: str, caller_phone: str) -> str:
     """Move a caller's existing booking from one class to another.
 
     Args:
@@ -288,39 +201,19 @@ def reschedule_booking(
     Returns:
         Confirmation string on success, or an error string on failure.
     """
-    log.info(
-        "TOOL reschedule_booking | old=%r  new=%r  name=%r  phone=%r",
-        old_class_id,
-        new_class_id,
-        caller_name,
-        caller_phone,
-    )
     if not caller_name or not caller_phone:
         return "ERROR: caller name and phone number are required before rescheduling. Ask the caller for both, then try again."
     caller_phone = _normalize_phone(caller_phone)
-    name_err = _validate_name(caller_name)
-    if name_err:
-        return name_err
-    phone_err = _validate_phone(caller_phone)
-    if phone_err:
-        return phone_err
+    if err := _validate_name(caller_name):
+        return err
+    if err := _validate_phone(caller_phone):
+        return err
     try:
-        confirmation = _calendar.reschedule_booking(
-            old_class_id, new_class_id, caller_name, caller_phone
-        )
-        log.info("TOOL reschedule_booking | success: %r", confirmation)
-        return confirmation
+        return _calendar.reschedule_booking(old_class_id, new_class_id, caller_name, caller_phone)
     except ValueError as exc:
-        log.warning("TOOL reschedule_booking | ValueError: %s", exc)
         return str(exc)
     except Exception as exc:
-        log.error(
-            "reschedule_booking failed (%s->%s): %s",
-            old_class_id,
-            new_class_id,
-            exc,
-            exc_info=True,
-        )
+        log.error("reschedule_booking failed (%s->%s): %s", old_class_id, new_class_id, exc, exc_info=True)
         return f"ERROR: reschedule failed — {exc}. Do not retry; tell the caller there was a technical problem."
 
 
@@ -336,32 +229,19 @@ def cancel_booking(class_id: str, caller_name: str, caller_phone: str) -> str:
     Returns:
         Confirmation string on success, or an error string if booking not found.
     """
-    log.info(
-        "TOOL cancel_booking | class_id=%r  name=%r  phone=%r",
-        class_id,
-        caller_name,
-        caller_phone,
-    )
     if not caller_name or not caller_phone:
         return "ERROR: caller name and phone number are required before cancelling. Ask the caller for both, then try again."
     caller_phone = _normalize_phone(caller_phone)
-    name_err = _validate_name(caller_name)
-    if name_err:
-        return name_err
-    phone_err = _validate_phone(caller_phone)
-    if phone_err:
-        return phone_err
+    if err := _validate_name(caller_name):
+        return err
+    if err := _validate_phone(caller_phone):
+        return err
     try:
-        confirmation = _calendar.cancel_booking(class_id, caller_name, caller_phone)
-        log.info("TOOL cancel_booking | success: %r", confirmation)
-        return confirmation
+        return _calendar.cancel_booking(class_id, caller_name, caller_phone)
     except ValueError as exc:
-        log.warning("TOOL cancel_booking | ValueError: %s", exc)
         return str(exc)
     except Exception as exc:
-        log.error(
-            "cancel_booking failed for event %s: %s", class_id, exc, exc_info=True
-        )
+        log.error("cancel_booking failed for event %s: %s", class_id, exc, exc_info=True)
         return f"ERROR: cancellation failed — {exc}. Do not retry; tell the caller there was a technical problem."
 
 
@@ -375,7 +255,6 @@ def get_studio_info(topic: str) -> str:
     Returns:
         Human-readable studio information string.
     """
-    log.info("TOOL get_studio_info | topic=%r", topic)
     info_map = {
         "hours": "We're open Monday through Saturday, 6 AM to 8 PM IST.",
         "pricing": "Drop-in classes are $30, and a 10-class pack is $200.",
@@ -383,18 +262,11 @@ def get_studio_info(topic: str) -> str:
         "birthday_party": "We do offer birthday party bookings — please contact the studio directly for group rates.",
         "general": "Solstice Pilates is open Monday through Saturday, 6 AM to 8 PM. Drop-ins are $30.",
     }
-    result = info_map.get(topic, info_map["general"])
-    log.info("TOOL get_studio_info | returning info for topic=%r", topic)
-    return result
+    return info_map.get(topic, info_map["general"])
 
 
 @tool
-def log_caller_note(
-    caller_phone: str,
-    caller_name: str,
-    topic: str,
-    notes: str,
-) -> str:
+def log_caller_note(caller_phone: str, caller_name: str, topic: str, notes: str) -> str:
     """Log or update a caller's record in Google Sheets.
 
     Args:
@@ -406,16 +278,9 @@ def log_caller_note(
     Returns:
         "Logged." on success, or an empty string on failure.
     """
-    log.info(
-        "TOOL log_caller_note | phone=%r  name=%r  topic=%r",
-        caller_phone,
-        caller_name,
-        topic,
-    )
     caller_phone = _normalize_phone(caller_phone)
     try:
         _sheets.upsert_caller(caller_phone, caller_name, topic, notes)
-        log.info("TOOL log_caller_note | saved to sheets")
         return "Logged."
     except Exception as exc:
         log.error("log_caller_note failed: %s", exc, exc_info=True)
@@ -432,26 +297,18 @@ def escalate_to_human(reason: str, caller_name: str, caller_phone: str) -> str:
     - Aggressive or abusive callers
 
     NEVER call this tool for bookings, cancellations, rescheduling, class
-    inquiries, pricing questions, or general studio information — handle
-    those yourself using the available tools.
+    inquiries, pricing questions, or general studio information.
 
-    IMPORTANT: Before calling this tool you MUST have the caller's name and
-    phone number. If you do not have them, ask for them first.
+    IMPORTANT: You MUST have the caller's name and phone before calling this tool.
 
     Args:
         reason:       Short description of why escalation is needed.
         caller_name:  Caller's full name.
-        caller_phone: Caller's phone number (any format is fine).
+        caller_phone: Caller's phone number (any format).
 
     Returns:
         Internal status string for the LLM (not spoken to the caller).
     """
-    log.info(
-        "TOOL escalate_to_human | name=%r  phone=%r  reason=%r",
-        caller_name,
-        caller_phone,
-        reason,
-    )
     caller_phone = _normalize_phone(caller_phone or "")
     try:
         _sheets.upsert_caller(
@@ -459,12 +316,6 @@ def escalate_to_human(reason: str, caller_name: str, caller_phone: str) -> str:
             name=caller_name,
             topic="escalation",
             notes=reason,
-        )
-        log.info(
-            "TOOL escalate_to_human | saved to CRM | name=%s  phone=%s  reason=%r",
-            caller_name,
-            caller_phone,
-            reason,
         )
     except Exception as exc:
         log.error("escalate_to_human: sheets write failed: %s", exc, exc_info=True)

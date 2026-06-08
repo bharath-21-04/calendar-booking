@@ -12,19 +12,13 @@ def get_system_prompt() -> str:
     for offset, label in ((1, "tomorrow"), (2, "day after tomorrow")):
         d = now + timedelta(days=offset)
         date_lines.append(f"  {label:<20} = {fmt(d)}  ({d.strftime('%Y-%m-%d')})")
-    # next 7 weekday names
     for i in range(1, 8):
         d = now + timedelta(days=i)
-        date_lines.append(
-            f"  next {d.strftime('%A'):<14} = {fmt(d)}  ({d.strftime('%Y-%m-%d')})"
-        )
-
-    date_block = "\n".join(date_lines)
-    current_dt = now.strftime("%A, %B %-d, %Y at %-I:%M %p %Z")
+        date_lines.append(f"  next {d.strftime('%A'):<14} = {fmt(d)}  ({d.strftime('%Y-%m-%d')})")
 
     return SYSTEM_PROMPT_TEMPLATE.format(
-        current_datetime=current_dt,
-        date_block=date_block,
+        current_datetime=now.strftime("%A, %B %-d, %Y at %-I:%M %p %Z"),
+        date_block="\n".join(date_lines),
     )
 
 
@@ -97,5 +91,3 @@ STRICT RULES:
 
 Never use bullet points, numbered lists, or markdown in your response.
 """
-
-SYSTEM_PROMPT = SYSTEM_PROMPT_TEMPLATE

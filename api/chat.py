@@ -13,30 +13,32 @@ router = APIRouter()
 
 
 class ChatRequest(BaseModel):
-    session_id: str = Field(
-        default_factory=lambda: str(uuid.uuid4()),
-        description="Unique session identifier. Generate on client if starting a new session.",
-    )
-    message: str = Field(..., description="The user's chat message.")
-    phone: Optional[str] = Field(
-        None,
-        description="Caller phone in E.164 format, e.g. +15551234567. Optional for text chat.",
-    )
+    session_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    message: str
+    phone: Optional[str] = None
 
 
 class ChatResponse(BaseModel):
-    reply: str = Field(..., description="Sol's response to the user.")
-    handoff: bool = Field(
-        False, description="True if this session has been escalated to a human."
-    )
-    session_id: str = Field(..., description="Echo of the session_id from the request.")
+    reply: str
+    handoff: bool = False
+    session_id: str
+
+
+def _extract_content(msg) -> str:
+    content = msg.content if hasattr(msg, "content") else msg
+    if isinstance(content, list):
+        return " ".join(
+            part["text"] if isinstance(part, dict) else str(part)
+            for part in content
+            if not isinstance(part, dict) or part.get("type") == "text"
+        )
+    return str(content)
 
 
 @router.post("/chat", response_model=ChatResponse, tags=["Chat"])
 async def chat(request: ChatRequest) -> ChatResponse:
     config = {"configurable": {"thread_id": request.session_id}}
-    existing = graph.get_state(config)
-    is_first_turn = not existing.values
+    is_first_turn = not graph.get_state(config).values
 
     if is_first_turn:
         input_state: AgentState = {
@@ -48,27 +50,15 @@ async def chat(request: ChatRequest) -> ChatResponse:
             "call_summary": "",
         }
     else:
-        input_state = {  # type: ignore[assignment]
+        input_state = {
             "messages": [{"role": "user", "content": request.message}],
             "caller_phone": request.phone or "",
             "session_id": request.session_id,
         }
 
     result = await graph.ainvoke(input_state, config=config)
-
-    last_msg = result["messages"][-1]
-    content = last_msg.content if hasattr(last_msg, "content") else last_msg
-    if isinstance(content, list):
-        reply = " ".join(
-            part["text"] if isinstance(part, dict) else str(part)
-            for part in content
-            if not isinstance(part, dict) or part.get("type") == "text"
-        )
-    else:
-        reply = str(content)
-
     return ChatResponse(
-        reply=reply,
+        reply=_extract_content(result["messages"][-1]),
         handoff=result.get("handoff", False),
         session_id=request.session_id,
     )
